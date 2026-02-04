@@ -24,6 +24,7 @@ jobs:
         pip install pyinstaller flask pywebview
     
     - name: Build EXE with PyInstaller
+      working-directory: FXTracker
       run: |
         if (Test-Path fx_icon.ico) {
           pyinstaller --onefile --windowed --name "FX Trade Tracker" --icon=fx_icon.ico --hidden-import=flask --hidden-import=sqlite3 --noconfirm fx_tracker_windows_app.py
@@ -36,4 +37,4 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: FX-Trade-Tracker-Windows
-        path: dist/*.exe
+        path: FXTracker/dist/*.exe
