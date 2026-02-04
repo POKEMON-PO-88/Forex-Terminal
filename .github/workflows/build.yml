@@ -1,0 +1,39 @@
+name: Build FX Tracker EXE
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller flask pywebview
+    
+    - name: Build EXE with PyInstaller
+      run: |
+        if (Test-Path fx_icon.ico) {
+          pyinstaller --onefile --windowed --name "FX Trade Tracker" --icon=fx_icon.ico --hidden-import=flask --hidden-import=sqlite3 --noconfirm fx_tracker_windows_app.py
+        } else {
+          pyinstaller --onefile --windowed --name "FX Trade Tracker" --hidden-import=flask --hidden-import=sqlite3 --noconfirm fx_tracker_windows_app.py
+        }
+      shell: powershell
+    
+    - name: Upload EXE
+      uses: actions/upload-artifact@v4
+      with:
+        name: FX-Trade-Tracker-Windows
+        path: dist/*.exe
