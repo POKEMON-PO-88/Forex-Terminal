@@ -1,6 +1,6 @@
-# fx_tracker_windows.py - ENHANCED VERSION
-# Windows Desktop App with Sorting, Filtering, and Trade History
-# PRODUCTION READY - FULLY FEATURED
+# fx_tracker_ultimate.py - ULTIMATE VERSION
+# All Features: Sorting, Filtering, Search, Manual Entry, Edit, Trade History
+# Works for both Windows desktop and web browser versions
 
 import sys
 import os
@@ -16,46 +16,36 @@ from datetime import datetime, timedelta
 # ============================================================================
 
 def install_packages():
-    """Silently install required packages if missing"""
-    packages = {
-        'flask': 'flask',
-        'webview': 'pywebview'
-    }
-    
-    for module_name, package_name in packages.items():
+    packages = {'flask': 'flask', 'flask_socketio': 'flask-socketio'}
+    for module, package in packages.items():
         try:
-            __import__(module_name)
+            __import__(module)
         except ImportError:
-            try:
-                subprocess.check_call(
-                    [sys.executable, '-m', 'pip', 'install', package_name, '--quiet'],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-            except:
-                pass
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', package, '--quiet'],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 try:
     install_packages()
-    from flask import Flask, render_template_string, jsonify
-    import webview
+    from flask import Flask, render_template_string, jsonify, request
+    from flask_socketio import SocketIO
 except ImportError:
-    print("Error: Could not install required packages")
-    print("Please run: pip install flask pywebview")
+    print("Error installing packages. Run: pip install flask flask-socketio")
     input("Press Enter to exit...")
     sys.exit(1)
+
+# For desktop version, try to import webview
+try:
+    import webview
+    HAS_WEBVIEW = True
+except ImportError:
+    HAS_WEBVIEW = False
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
 class Config:
-    """Application configuration"""
-    
-    # DATABASE LOCATION
     SHARED_FOLDER = r"Z:\TradingDesk\FXTracker"
-    
-    # For testing:
     # SHARED_FOLDER = os.path.join(os.path.expanduser('~'), 'Desktop', 'FXTracker_Test')
     
     try:
@@ -67,13 +57,13 @@ class Config:
         DATABASE_FILE = os.path.join(SHARED_FOLDER, 'team_fx_trades.db')
     
     USE_REAL_BLOOMBERG = True
-    PORT = 8765
+    PORT = 8080
     
+    # Desktop window settings (if using webview)
     WINDOW_TITLE = "FX Trade Tracker"
     WINDOW_WIDTH = 1600
     WINDOW_HEIGHT = 950
-    WINDOW_MIN_WIDTH = 1200
-    WINDOW_MIN_HEIGHT = 700
+    USE_DESKTOP_WINDOW = HAS_WEBVIEW  # Auto-detect
 
 # ============================================================================
 # BLOOMBERG CONNECTOR
@@ -106,18 +96,13 @@ class BloombergConnector:
             if not self.session.start():
                 raise Exception("Connection failed")
             
-            self.connection_status = "✅ Connected to Bloomberg Terminal"
+            self.connection_status = "✅ Connected to Bloomberg"
             
             if self.session.openService("//blp/emapisvc"):
                 self.connection_status = "✅ Connected - Monitoring team blotter"
             else:
-                self.connection_status = "✅ Connected - EMSX not available"
                 self.use_real = False
                 self.mock_api = MockBloombergAPI()
-        except ImportError:
-            self.connection_status = "⚠️ Demo mode"
-            self.use_real = False
-            self.mock_api = MockBloombergAPI()
         except:
             self.connection_status = "⚠️ Demo mode"
             self.use_real = False
@@ -182,10 +167,7 @@ class MockBloombergAPI:
         return self.trades
     
     def get_current_rate(self, pair):
-        base_rates = {
-            'EUR/USD': 1.0850, 'GBP/USD': 1.2650, 'USD/JPY': 148.50,
-            'AUD/USD': 0.6550, 'USD/CHF': 0.8450, 'EUR/GBP': 0.8580
-        }
+        base_rates = {'EUR/USD': 1.0850, 'GBP/USD': 1.2650, 'USD/JPY': 148.50, 'AUD/USD': 0.6550, 'USD/CHF': 0.8450, 'EUR/GBP': 0.8580}
         return round(base_rates.get(pair, 1.0) + random.uniform(-0.02, 0.02), 4)
     
     def maybe_generate_new_trade(self):
@@ -197,18 +179,15 @@ class MockBloombergAPI:
             
             trade = {
                 'trade_id': f'FX{datetime.now().strftime("%Y%m%d")}{self.trade_counter:03d}',
-                'timestamp': datetime.now(),
-                'currency_pair': pair,
+                'timestamp': datetime.now(), 'currency_pair': pair,
                 'side': random.choice(['BUY', 'SELL']),
                 'notional_amount': random.randint(1000000, 15000000),
-                'base_currency': currencies[0],
-                'quote_currency': currencies[1],
+                'base_currency': currencies[0], 'quote_currency': currencies[1],
                 'execution_rate': self.get_current_rate(pair),
                 'value_date': (datetime.now() + timedelta(days=2)).date(),
                 'settlement_date': (datetime.now() + timedelta(days=2)).date(),
                 'counterparty': random.choice(['JP Morgan', 'Citi', 'HSBC']),
-                'trader_name': random.choice(traders),
-                'status': 'open'
+                'trader_name': random.choice(traders), 'status': 'open'
             }
             
             self.trades.append(trade)
@@ -288,7 +267,7 @@ class SharedDatabase:
                 
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_status ON trades(status)")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_trader ON trades(trader_name)")
-                cursor.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON trades(timestamp DESC)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_pair ON trades(currency_pair)")
                 
                 conn.commit()
                 conn.close()
@@ -318,8 +297,22 @@ class SharedDatabase:
                 
                 conn.commit()
                 conn.close()
+                return True
         except Exception as e:
             print(f"Save error: {e}")
+            return False
+    
+    def delete_trade(self, trade_id):
+        try:
+            with self.lock:
+                conn = sqlite3.connect(self.db_file, timeout=10.0)
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM trades WHERE trade_id = ?", (trade_id,))
+                conn.commit()
+                conn.close()
+                return True
+        except:
+            return False
     
     def get_all_trades(self):
         try:
@@ -346,31 +339,18 @@ class SharedDatabase:
                 return [dict(row) for row in rows]
         except:
             return []
-    
-    def get_closed_trades(self):
-        try:
-            with self.lock:
-                conn = sqlite3.connect(self.db_file, timeout=10.0)
-                conn.row_factory = sqlite3.Row
-                cursor = conn.cursor()
-                cursor.execute("SELECT * FROM trades WHERE status = 'closed' ORDER BY timestamp DESC")
-                rows = cursor.fetchall()
-                conn.close()
-                return [dict(row) for row in rows]
-        except:
-            return []
 
 shared_db = SharedDatabase(Config.DATABASE_FILE)
 
 # ============================================================================
-# FLASK APP WITH ENHANCED API
+# FLASK APP WITH ALL FEATURES
 # ============================================================================
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'fx-tracker-windows'
+app.config['SECRET_KEY'] = 'fx-tracker-ultimate'
+socketio = SocketIO(app, cors_allowed_origins="*")
 tracker_instance = None
 
-# ENHANCED HTML WITH SORTING AND FILTERING
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
@@ -379,269 +359,93 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <title>FX Trade Tracker</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            padding: 20px;
-            min-height: 100vh;
-        }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 20px; min-height: 100vh; }
         .container { max-width: 1900px; margin: 0 auto; }
-        .header { 
-            background: white;
-            padding: 25px 30px;
-            border-radius: 12px;
-            margin-bottom: 20px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.15);
-        }
-        .header h1 { 
-            color: #2d3748;
-            font-size: 28px;
-            margin-bottom: 8px;
-            font-weight: 700;
-        }
-        .subtitle { 
-            color: #718096;
-            font-size: 14px;
-            margin-bottom: 15px;
-        }
-        .connection-badge {
-            display: inline-block;
-            padding: 6px 14px;
-            border-radius: 6px;
-            font-size: 13px;
-            font-weight: 600;
-            background: #fef5e7;
-            color: #f39c12;
-            margin-bottom: 15px;
-        }
-        .controls {
-            display: flex;
-            gap: 10px;
-            margin-top: 15px;
-            margin-bottom: 15px;
-        }
-        .filter-btn {
-            padding: 10px 20px;
-            border: none;
-            border-radius: 8px;
-            font-size: 14px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.2s;
-        }
-        .filter-btn.active {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-        }
-        .filter-btn:not(.active) {
-            background: #edf2f7;
-            color: #4a5568;
-        }
-        .filter-btn:hover {
-            transform: translateY(-1px);
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-        }
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
-            margin-top: 15px;
-        }
-        .stat-card {
-            background: linear-gradient(135deg, #f7fafc 0%, #edf2f7 100%);
-            padding: 18px 20px;
-            border-radius: 10px;
-            border-left: 4px solid #667eea;
-            transition: transform 0.2s;
-        }
+        .header { background: white; padding: 25px 30px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 20px rgba(0,0,0,0.15); }
+        .header h1 { color: #2d3748; font-size: 28px; margin-bottom: 8px; font-weight: 700; }
+        .subtitle { color: #718096; font-size: 14px; margin-bottom: 15px; }
+        .connection-badge { display: inline-block; padding: 6px 14px; border-radius: 6px; font-size: 13px; font-weight: 600; background: #fef5e7; color: #f39c12; margin-bottom: 15px; }
+        .controls { display: flex; gap: 10px; margin-top: 15px; margin-bottom: 15px; flex-wrap: wrap; align-items: center; }
+        .filter-btn, .action-btn { padding: 10px 20px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+        .filter-btn.active { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
+        .filter-btn:not(.active) { background: #edf2f7; color: #4a5568; }
+        .action-btn { background: #48bb78; color: white; }
+        .action-btn.secondary { background: #ed8936; }
+        .filter-btn:hover, .action-btn:hover { transform: translateY(-1px); box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
+        .search-box { padding: 10px 15px; border: 2px solid #e2e8f0; border-radius: 8px; font-size: 14px; width: 300px; transition: border 0.2s; }
+        .search-box:focus { outline: none; border-color: #667eea; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-top: 15px; }
+        .stat-card { background: linear-gradient(135deg, #f7fafc 0%, #edf2f7 100%); padding: 18px 20px; border-radius: 10px; border-left: 4px solid #667eea; transition: transform 0.2s; }
         .stat-card:hover { transform: translateY(-2px); }
-        .stat-label {
-            font-size: 11px;
-            color: #718096;
-            text-transform: uppercase;
-            font-weight: 600;
-            letter-spacing: 0.5px;
-            margin-bottom: 8px;
-        }
-        .stat-value {
-            font-size: 26px;
-            font-weight: 700;
-            color: #2d3748;
-        }
-        .trades-table-container {
-            background: white;
-            border-radius: 12px;
-            overflow: hidden;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.15);
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-        thead {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        }
-        th {
-            padding: 16px 15px;
-            text-align: left;
-            color: white;
-            font-weight: 600;
-            font-size: 13px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            cursor: pointer;
-            user-select: none;
-            position: relative;
-            transition: background 0.2s;
-        }
-        th:hover {
-            background: rgba(255,255,255,0.1);
-        }
-        th.sortable::after {
-            content: ' ⇅';
-            opacity: 0.5;
-        }
-        th.sort-asc::after {
-            content: ' ↑';
-            opacity: 1;
-        }
-        th.sort-desc::after {
-            content: ' ↓';
-            opacity: 1;
-        }
-        tbody tr {
-            transition: background 0.2s;
-        }
-        tbody tr:hover {
-            background: #f7fafc;
-        }
-        td {
-            padding: 14px 15px;
-            border-bottom: 1px solid #e2e8f0;
-            font-size: 14px;
-        }
-        .trade-id {
-            font-family: 'Courier New', monospace;
-            font-weight: 700;
-            color: #667eea;
-            background: #edf2f7;
-            padding: 4px 8px;
-            border-radius: 4px;
-            font-size: 13px;
-        }
-        .currency-pair {
-            font-weight: 600;
-            font-size: 14px;
-            color: #2d3748;
-        }
-        .side-buy {
-            background: #c6f6d5;
-            color: #22543d;
-            padding: 5px 12px;
-            border-radius: 6px;
-            font-weight: 700;
-            font-size: 12px;
-            display: inline-block;
-        }
-        .side-sell {
-            background: #fed7d7;
-            color: #742a2a;
-            padding: 5px 12px;
-            border-radius: 6px;
-            font-weight: 700;
-            font-size: 12px;
-            display: inline-block;
-        }
-        .status-open {
-            background: #fef5e7;
-            color: #f39c12;
-            padding: 5px 12px;
-            border-radius: 6px;
-            font-weight: 700;
-            font-size: 11px;
-            text-transform: uppercase;
-            display: inline-block;
-        }
-        .status-closed {
-            background: #d5f4e6;
-            color: #27ae60;
-            padding: 5px 12px;
-            border-radius: 6px;
-            font-weight: 700;
-            font-size: 11px;
-            text-transform: uppercase;
-            display: inline-block;
-        }
-        .pnl-positive {
-            color: #48bb78;
-            font-weight: 700;
-            font-size: 15px;
-        }
-        .pnl-negative {
-            color: #f56565;
-            font-weight: 700;
-            font-size: 15px;
-        }
-        .trader-badge {
-            background: #edf2f7;
-            padding: 4px 10px;
-            border-radius: 5px;
-            font-size: 12px;
-            font-weight: 600;
-            color: #4a5568;
-        }
-        .rate-display {
-            font-family: 'Courier New', monospace;
-            font-weight: 600;
-            color: #2d3748;
-        }
-        .loading-message {
-            text-align: center;
-            padding: 60px 20px;
-            color: #a0aec0;
-            font-size: 16px;
-        }
+        .stat-label { font-size: 11px; color: #718096; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px; margin-bottom: 8px; }
+        .stat-value { font-size: 26px; font-weight: 700; color: #2d3748; }
+        .trades-table-container { background: white; border-radius: 12px; overflow: auto; box-shadow: 0 4px 20px rgba(0,0,0,0.15); max-height: 600px; }
+        table { width: 100%; border-collapse: collapse; }
+        thead { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); position: sticky; top: 0; z-index: 10; }
+        th { padding: 16px 15px; text-align: left; color: white; font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; user-select: none; transition: background 0.2s; }
+        th:hover { background: rgba(255,255,255,0.1); }
+        th.sortable::after { content: ' ⇅'; opacity: 0.5; }
+        th.sort-asc::after { content: ' ↑'; opacity: 1; }
+        th.sort-desc::after { content: ' ↓'; opacity: 1; }
+        tbody tr { transition: background 0.2s; }
+        tbody tr:hover { background: #f7fafc; }
+        td { padding: 14px 15px; border-bottom: 1px solid #e2e8f0; font-size: 14px; }
+        .trade-id { font-family: 'Courier New', monospace; font-weight: 700; color: #667eea; background: #edf2f7; padding: 4px 8px; border-radius: 4px; font-size: 13px; }
+        .currency-pair { font-weight: 600; color: #2d3748; }
+        .side-buy { background: #c6f6d5; color: #22543d; padding: 5px 12px; border-radius: 6px; font-weight: 700; font-size: 12px; display: inline-block; }
+        .side-sell { background: #fed7d7; color: #742a2a; padding: 5px 12px; border-radius: 6px; font-weight: 700; font-size: 12px; display: inline-block; }
+        .status-open { background: #fef5e7; color: #f39c12; padding: 5px 12px; border-radius: 6px; font-weight: 700; font-size: 11px; text-transform: uppercase; display: inline-block; }
+        .status-closed { background: #d5f4e6; color: #27ae60; padding: 5px 12px; border-radius: 6px; font-weight: 700; font-size: 11px; text-transform: uppercase; display: inline-block; }
+        .pnl-positive { color: #48bb78; font-weight: 700; font-size: 15px; }
+        .pnl-negative { color: #f56565; font-weight: 700; font-size: 15px; }
+        .trader-badge { background: #edf2f7; padding: 4px 10px; border-radius: 5px; font-size: 12px; font-weight: 600; color: #4a5568; }
+        .rate-display { font-family: 'Courier New', monospace; font-weight: 600; color: #2d3748; }
+        .edit-btn, .delete-btn { padding: 4px 10px; border: none; border-radius: 4px; font-size: 11px; font-weight: 600; cursor: pointer; margin-right: 5px; transition: all 0.2s; }
+        .edit-btn { background: #4299e1; color: white; }
+        .delete-btn { background: #fc8181; color: white; }
+        .edit-btn:hover, .delete-btn:hover { transform: scale(1.05); }
+        
+        /* Modal Styles */
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); z-index: 1000; justify-content: center; align-items: center; }
+        .modal.active { display: flex; }
+        .modal-content { background: white; padding: 30px; border-radius: 12px; width: 600px; max-width: 90%; max-height: 90vh; overflow-y: auto; box-shadow: 0 10px 40px rgba(0,0,0,0.3); }
+        .modal-header { font-size: 22px; font-weight: 700; color: #2d3748; margin-bottom: 20px; }
+        .form-group { margin-bottom: 15px; }
+        .form-label { display: block; font-size: 13px; font-weight: 600; color: #4a5568; margin-bottom: 5px; }
+        .form-input, .form-select { width: 100%; padding: 10px; border: 2px solid #e2e8f0; border-radius: 6px; font-size: 14px; transition: border 0.2s; }
+        .form-input:focus, .form-select:focus { outline: none; border-color: #667eea; }
+        .form-actions { display: flex; gap: 10px; margin-top: 20px; }
+        .btn-primary { flex: 1; padding: 12px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; transition: transform 0.2s; }
+        .btn-secondary { flex: 1; padding: 12px; background: #e2e8f0; color: #4a5568; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; transition: transform 0.2s; }
+        .btn-primary:hover, .btn-secondary:hover { transform: translateY(-1px); }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <h1>📊 FX Trade Tracker</h1>
-            <div class="subtitle">Team Dashboard • Windows Desktop App • Enhanced with Sorting & Filtering</div>
+            <div class="subtitle">Team Dashboard • Enhanced with Search, Manual Entry & Edit</div>
             <div class="connection-badge" id="status-badge">Loading...</div>
             
             <div class="controls">
                 <button class="filter-btn active" onclick="filterTrades('all')" id="btn-all">All Trades</button>
                 <button class="filter-btn" onclick="filterTrades('open')" id="btn-open">Open Only</button>
                 <button class="filter-btn" onclick="filterTrades('closed')" id="btn-closed">Closed History</button>
+                <input type="text" class="search-box" placeholder="🔍 Search trades (ID, pair, trader, counterparty...)" id="search-box" oninput="searchTrades()">
+                <button class="action-btn" onclick="openAddTradeModal()">➕ Add Trade</button>
             </div>
             
             <div class="stats-grid">
-                <div class="stat-card">
-                    <div class="stat-label">Total Trades</div>
-                    <div class="stat-value" id="trade-count">0</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">Open Positions</div>
-                    <div class="stat-value" id="open-count">0</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">Closed Trades</div>
-                    <div class="stat-value" id="closed-count">0</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">Team P&L</div>
-                    <div class="stat-value" id="total-pnl">$0.00</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">Last Update</div>
-                    <div class="stat-value" style="font-size: 16px;" id="last-update">--:--:--</div>
-                </div>
+                <div class="stat-card"><div class="stat-label">Total Trades</div><div class="stat-value" id="trade-count">0</div></div>
+                <div class="stat-card"><div class="stat-label">Open Positions</div><div class="stat-value" id="open-count">0</div></div>
+                <div class="stat-card"><div class="stat-label">Closed Trades</div><div class="stat-value" id="closed-count">0</div></div>
+                <div class="stat-card"><div class="stat-label">Team P&L</div><div class="stat-value" id="total-pnl">$0.00</div></div>
+                <div class="stat-card"><div class="stat-label">Last Update</div><div class="stat-value" style="font-size: 16px;" id="last-update">--:--:--</div></div>
             </div>
         </div>
         
         <div class="trades-table-container">
-            <table id="trades-table">
+            <table>
                 <thead>
                     <tr>
                         <th class="sortable" onclick="sortTable('trade_id')">Trade ID</th>
@@ -650,41 +454,103 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         <th class="sortable" onclick="sortTable('pair')">Pair</th>
                         <th class="sortable" onclick="sortTable('side')">Side</th>
                         <th class="sortable" onclick="sortTable('amount')">Amount</th>
-                        <th class="sortable" onclick="sortTable('entry_rate')">Entry Rate</th>
-                        <th class="sortable" onclick="sortTable('current_rate')">Current Rate</th>
+                        <th class="sortable" onclick="sortTable('entry_rate')">Entry</th>
+                        <th class="sortable" onclick="sortTable('current_rate')">Current</th>
                         <th class="sortable" onclick="sortTable('pnl')">P&L</th>
                         <th class="sortable" onclick="sortTable('status')">Status</th>
+                        <th>Actions</th>
                     </tr>
                 </thead>
                 <tbody id="trades-tbody">
-                    <tr>
-                        <td colspan="10" class="loading-message">⏳ Loading trades...</td>
-                    </tr>
+                    <tr><td colspan="11" style="text-align: center; padding: 60px;">⏳ Loading...</td></tr>
                 </tbody>
             </table>
+        </div>
+    </div>
+
+    <!-- Add/Edit Trade Modal -->
+    <div id="trade-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header" id="modal-title">Add New Trade</div>
+            <form id="trade-form" onsubmit="saveTrade(event)">
+                <div class="form-group">
+                    <label class="form-label">Trade ID*</label>
+                    <input type="text" class="form-input" id="input-trade-id" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Currency Pair*</label>
+                    <select class="form-select" id="input-pair" required>
+                        <option value="">Select pair...</option>
+                        <option value="EUR/USD">EUR/USD</option>
+                        <option value="GBP/USD">GBP/USD</option>
+                        <option value="USD/JPY">USD/JPY</option>
+                        <option value="AUD/USD">AUD/USD</option>
+                        <option value="USD/CHF">USD/CHF</option>
+                        <option value="EUR/GBP">EUR/GBP</option>
+                        <option value="USD/CAD">USD/CAD</option>
+                        <option value="NZD/USD">NZD/USD</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Side*</label>
+                    <select class="form-select" id="input-side" required>
+                        <option value="">Select side...</option>
+                        <option value="BUY">BUY</option>
+                        <option value="SELL">SELL</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Notional Amount*</label>
+                    <input type="number" class="form-input" id="input-amount" step="1000" min="0" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Execution Rate*</label>
+                    <input type="number" class="form-input" id="input-rate" step="0.0001" min="0" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Trader Name*</label>
+                    <input type="text" class="form-input" id="input-trader" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Counterparty*</label>
+                    <input type="text" class="form-input" id="input-counterparty" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Status*</label>
+                    <select class="form-select" id="input-status" required>
+                        <option value="open">Open</option>
+                        <option value="closed">Closed</option>
+                    </select>
+                </div>
+                <div class="form-actions">
+                    <button type="submit" class="btn-primary">Save Trade</button>
+                    <button type="button" class="btn-secondary" onclick="closeModal()">Cancel</button>
+                </div>
+            </form>
         </div>
     </div>
 
     <script>
         let allTrades = [];
         let currentFilter = 'all';
+        let searchQuery = '';
         let sortColumn = 'timestamp';
         let sortDirection = 'desc';
-        let updateInProgress = false;
+        let editingTradeId = null;
         
         function filterTrades(filter) {
             currentFilter = filter;
-            
-            // Update button states
             document.querySelectorAll('.filter-btn').forEach(btn => btn.classList.remove('active'));
             document.getElementById('btn-' + filter).classList.add('active');
-            
-            // Re-render with current filter
+            renderTrades(allTrades);
+        }
+        
+        function searchTrades() {
+            searchQuery = document.getElementById('search-box').value.toLowerCase();
             renderTrades(allTrades);
         }
         
         function sortTable(column) {
-            // Toggle direction if same column, otherwise default to desc
             if (sortColumn === column) {
                 sortDirection = sortDirection === 'asc' ? 'desc' : 'asc';
             } else {
@@ -692,15 +558,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 sortDirection = 'desc';
             }
             
-            // Update header indicators
-            document.querySelectorAll('th').forEach(th => {
-                th.classList.remove('sort-asc', 'sort-desc');
-            });
-            
-            const clickedHeader = event.target;
-            clickedHeader.classList.add(sortDirection === 'asc' ? 'sort-asc' : 'sort-desc');
-            
-            // Re-render with new sort
+            document.querySelectorAll('th').forEach(th => th.classList.remove('sort-asc', 'sort-desc'));
+            event.target.classList.add(sortDirection === 'asc' ? 'sort-asc' : 'sort-desc');
             renderTrades(allTrades);
         }
         
@@ -720,23 +579,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }
         }
         
+        function matchesSearch(trade) {
+            if (!searchQuery) return true;
+            const searchableText = `${trade.trade_id} ${trade.pair} ${trade.trader} ${trade.counterparty} ${trade.side}`.toLowerCase();
+            return searchableText.includes(searchQuery);
+        }
+        
         function renderTrades(trades) {
             const tbody = document.getElementById('trades-tbody');
             tbody.innerHTML = '';
             
-            // Filter trades
-            let filteredTrades = trades;
-            if (currentFilter === 'open') {
-                filteredTrades = trades.filter(t => t.status === 'open');
-            } else if (currentFilter === 'closed') {
-                filteredTrades = trades.filter(t => t.status === 'closed');
+            // Filter by status
+            let filtered = trades;
+            if (currentFilter === 'open') filtered = trades.filter(t => t.status === 'open');
+            if (currentFilter === 'closed') filtered = trades.filter(t => t.status === 'closed');
+            
+            // Filter by search
+            if (searchQuery) {
+                filtered = filtered.filter(t => matchesSearch(t));
             }
             
-            // Sort trades
-            filteredTrades.sort((a, b) => {
+            // Sort
+            filtered.sort((a, b) => {
                 const aVal = getSortValue(a, sortColumn);
                 const bVal = getSortValue(b, sortColumn);
-                
                 if (aVal < bVal) return sortDirection === 'asc' ? -1 : 1;
                 if (aVal > bVal) return sortDirection === 'asc' ? 1 : -1;
                 return 0;
@@ -744,92 +610,158 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             
             // Update stats
             document.getElementById('trade-count').textContent = trades.length;
-            const openTrades = trades.filter(t => t.status === 'open');
-            const closedTrades = trades.filter(t => t.status === 'closed');
-            document.getElementById('open-count').textContent = openTrades.length;
-            document.getElementById('closed-count').textContent = closedTrades.length;
+            document.getElementById('open-count').textContent = trades.filter(t => t.status === 'open').length;
+            document.getElementById('closed-count').textContent = trades.filter(t => t.status === 'closed').length;
             document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
             
-            // Calculate total P&L
             const totalPnL = trades.reduce((sum, t) => sum + (parseFloat(t.pnl) || 0), 0);
-            const pnlElement = document.getElementById('total-pnl');
-            pnlElement.textContent = (totalPnL >= 0 ? '+' : '') + '$' + Math.abs(totalPnL).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
-            pnlElement.style.color = totalPnL >= 0 ? '#48bb78' : '#f56565';
+            const pnlEl = document.getElementById('total-pnl');
+            pnlEl.textContent = (totalPnL >= 0 ? '+' : '') + '$' + Math.abs(totalPnL).toLocaleString('en-US', {minimumFractionDigits: 2});
+            pnlEl.style.color = totalPnL >= 0 ? '#48bb78' : '#f56565';
             
-            // Render trades
-            if (filteredTrades.length === 0) {
-                let message = 'No trades yet.';
-                if (currentFilter === 'open') message = 'No open positions.';
-                if (currentFilter === 'closed') message = 'No closed trades yet.';
-                tbody.innerHTML = `<tr><td colspan="10" class="loading-message">${message}</td></tr>`;
+            // Render
+            if (filtered.length === 0) {
+                let msg = searchQuery ? 'No trades match your search.' : 'No trades yet.';
+                if (currentFilter === 'open' && !searchQuery) msg = 'No open positions.';
+                if (currentFilter === 'closed' && !searchQuery) msg = 'No closed trades yet.';
+                tbody.innerHTML = `<tr><td colspan="11" style="text-align: center; padding: 60px; color: #a0aec0;">${msg}</td></tr>`;
                 return;
             }
             
-            filteredTrades.forEach(trade => {
+            filtered.forEach(t => {
                 const row = tbody.insertRow();
-                const pnl = parseFloat(trade.pnl) || 0;
-                const pnlClass = pnl >= 0 ? 'pnl-positive' : 'pnl-negative';
-                const pnlSign = pnl >= 0 ? '+' : '';
-                
-                const timestamp = new Date(trade.timestamp);
-                const timeStr = timestamp.toLocaleString('en-US', {
-                    month: 'short',
-                    day: 'numeric',
-                    hour: '2-digit',
-                    minute: '2-digit'
-                });
+                const pnl = parseFloat(t.pnl) || 0;
+                const time = new Date(t.timestamp).toLocaleString('en-US', {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
                 
                 row.innerHTML = `
-                    <td><span class="trade-id">${trade.trade_id}</span></td>
-                    <td>${timeStr}</td>
-                    <td><span class="trader-badge">${trade.trader}</span></td>
-                    <td><span class="currency-pair">${trade.pair}</span></td>
-                    <td><span class="side-${trade.side.toLowerCase()}">${trade.side}</span></td>
-                    <td>${trade.amount.toLocaleString('en-US', {maximumFractionDigits: 0})}</td>
-                    <td class="rate-display">${trade.entry_rate.toFixed(4)}</td>
-                    <td class="rate-display">${trade.current_rate ? trade.current_rate.toFixed(4) : '--'}</td>
-                    <td class="${pnlClass}">${pnlSign}$${Math.abs(pnl).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>
-                    <td><span class="status-${trade.status}">${trade.status.toUpperCase()}</span></td>
+                    <td><span class="trade-id">${t.trade_id}</span></td>
+                    <td>${time}</td>
+                    <td><span class="trader-badge">${t.trader}</span></td>
+                    <td><span class="currency-pair">${t.pair}</span></td>
+                    <td><span class="side-${t.side.toLowerCase()}">${t.side}</span></td>
+                    <td>${t.amount.toLocaleString('en-US', {maximumFractionDigits: 0})}</td>
+                    <td class="rate-display">${t.entry_rate.toFixed(4)}</td>
+                    <td class="rate-display">${t.current_rate ? t.current_rate.toFixed(4) : '--'}</td>
+                    <td class="${pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}">${pnl >= 0 ? '+' : ''}$${Math.abs(pnl).toLocaleString('en-US', {minimumFractionDigits: 2})}</td>
+                    <td><span class="status-${t.status}">${t.status.toUpperCase()}</span></td>
+                    <td>
+                        <button class="edit-btn" onclick='editTrade(${JSON.stringify(t)})'>Edit</button>
+                        <button class="delete-btn" onclick="deleteTrade('${t.trade_id}')">Delete</button>
+                    </td>
                 `;
+            });
+        }
+        
+        function openAddTradeModal() {
+            editingTradeId = null;
+            document.getElementById('modal-title').textContent = 'Add New Trade';
+            document.getElementById('trade-form').reset();
+            document.getElementById('input-trade-id').value = 'FX' + new Date().toISOString().slice(0,10).replace(/-/g,'') + Math.floor(Math.random()*1000).toString().padStart(3,'0');
+            document.getElementById('input-trade-id').readOnly = false;
+            document.getElementById('trade-modal').classList.add('active');
+        }
+        
+        function editTrade(trade) {
+            editingTradeId = trade.trade_id;
+            document.getElementById('modal-title').textContent = 'Edit Trade';
+            document.getElementById('input-trade-id').value = trade.trade_id;
+            document.getElementById('input-trade-id').readOnly = true;
+            document.getElementById('input-pair').value = trade.pair;
+            document.getElementById('input-side').value = trade.side;
+            document.getElementById('input-amount').value = trade.amount;
+            document.getElementById('input-rate').value = trade.entry_rate;
+            document.getElementById('input-trader').value = trade.trader;
+            document.getElementById('input-counterparty').value = trade.counterparty || '';
+            document.getElementById('input-status').value = trade.status;
+            document.getElementById('trade-modal').classList.add('active');
+        }
+        
+        function closeModal() {
+            document.getElementById('trade-modal').classList.remove('active');
+            editingTradeId = null;
+        }
+        
+        function saveTrade(event) {
+            event.preventDefault();
+            
+            const pair = document.getElementById('input-pair').value;
+            const currencies = pair.split('/');
+            
+            const tradeData = {
+                trade_id: document.getElementById('input-trade-id').value,
+                timestamp: new Date().toISOString(),
+                currency_pair: pair,
+                base_currency: currencies[0],
+                quote_currency: currencies[1],
+                side: document.getElementById('input-side').value,
+                notional_amount: parseFloat(document.getElementById('input-amount').value),
+                execution_rate: parseFloat(document.getElementById('input-rate').value),
+                trader_name: document.getElementById('input-trader').value,
+                counterparty: document.getElementById('input-counterparty').value,
+                status: document.getElementById('input-status').value,
+                value_date: new Date(Date.now() + 2*24*60*60*1000).toISOString().split('T')[0],
+                settlement_date: new Date(Date.now() + 2*24*60*60*1000).toISOString().split('T')[0]
+            };
+            
+            fetch('/api/trade', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(tradeData)
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    closeModal();
+                    updateTrades();
+                } else {
+                    alert('Error saving trade: ' + (data.error || 'Unknown error'));
+                }
+            })
+            .catch(error => {
+                alert('Error: ' + error);
+            });
+        }
+        
+        function deleteTrade(tradeId) {
+            if (!confirm(`Delete trade ${tradeId}?`)) return;
+            
+            fetch('/api/trade/' + tradeId, {method: 'DELETE'})
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    updateTrades();
+                } else {
+                    alert('Error deleting trade');
+                }
             });
         }
         
         function updateStatus() {
             fetch('/api/status')
-                .then(response => response.json())
-                .then(data => {
-                    document.getElementById('status-badge').textContent = data.status || 'Unknown';
-                })
-                .catch(error => console.error('Status error:', error));
+                .then(r => r.json())
+                .then(d => { document.getElementById('status-badge').textContent = d.status; })
+                .catch(() => {});
         }
         
         function updateTrades() {
-            if (updateInProgress) return;
-            updateInProgress = true;
-            
             fetch('/api/trades')
-                .then(response => response.json())
+                .then(r => r.json())
                 .then(trades => {
                     allTrades = trades;
                     renderTrades(trades);
                 })
-                .catch(error => {
-                    console.error('Trades error:', error);
-                    document.getElementById('trades-tbody').innerHTML = 
-                        '<tr><td colspan="10" class="loading-message">Error loading. Retrying...</td></tr>';
-                })
-                .finally(() => {
-                    updateInProgress = false;
-                });
+                .catch(() => {});
         }
         
-        // Initial load
         updateStatus();
         updateTrades();
-        
-        // Regular updates
         setInterval(updateStatus, 5000);
         setInterval(updateTrades, 1000);
+        
+        // Close modal on Escape key
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeModal();
+        });
     </script>
 </body>
 </html>"""
@@ -843,16 +775,12 @@ def api_get_trades():
     try:
         trades = shared_db.get_all_trades()
         return jsonify([{
-            'trade_id': t['trade_id'],
-            'timestamp': str(t['timestamp']),
-            'pair': t['currency_pair'],
-            'side': t['side'],
-            'amount': float(t['notional_amount']),
+            'trade_id': t['trade_id'], 'timestamp': str(t['timestamp']), 'pair': t['currency_pair'],
+            'side': t['side'], 'amount': float(t['notional_amount']),
             'entry_rate': float(t['execution_rate']),
             'current_rate': float(t['current_market_rate']) if t['current_market_rate'] else None,
             'pnl': float(t['unrealized_pnl']) if t['status'] == 'open' else (float(t['realized_pnl']) if t['realized_pnl'] else 0.0),
-            'status': t['status'],
-            'trader': t['trader_name']
+            'status': t['status'], 'trader': t['trader_name'], 'counterparty': t.get('counterparty', '')
         } for t in trades])
     except:
         return jsonify([]), 500
@@ -860,11 +788,34 @@ def api_get_trades():
 @app.route('/api/status')
 def api_status():
     try:
-        if not tracker_instance:
-            return jsonify({'status': 'Initializing...'})
-        return jsonify({'status': tracker_instance.bloomberg.get_connection_status()})
+        return jsonify({'status': tracker_instance.bloomberg.get_connection_status() if tracker_instance else 'Initializing...'})
     except:
         return jsonify({'status': 'Error'}), 500
+
+@app.route('/api/trade', methods=['POST'])
+def api_add_trade():
+    try:
+        data = request.get_json()
+        trade = scrub_trade_details(data)
+        
+        if trade and shared_db.save_trade(trade):
+            if tracker_instance:
+                tracker_instance.tracked_trades.add(trade['trade_id'])
+            return jsonify({'success': True})
+        return jsonify({'success': False, 'error': 'Invalid trade data'}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/trade/<trade_id>', methods=['DELETE'])
+def api_delete_trade(trade_id):
+    try:
+        if shared_db.delete_trade(trade_id):
+            if tracker_instance and trade_id in tracker_instance.tracked_trades:
+                tracker_instance.tracked_trades.remove(trade_id)
+            return jsonify({'success': True})
+        return jsonify({'success': False}), 404
+    except:
+        return jsonify({'success': False}), 500
 
 # ============================================================================
 # TRACKER
@@ -887,30 +838,23 @@ class TeamFXTracker:
                 for trade_raw in self.bloomberg.get_trades():
                     if not trade_raw or not trade_raw.get('trade_id'):
                         continue
-                    
                     trade = scrub_trade_details(trade_raw)
-                    if not trade:
-                        continue
-                    
-                    if trade['trade_id'] not in self.tracked_trades:
+                    if trade and trade['trade_id'] not in self.tracked_trades:
                         self.tracked_trades.add(trade['trade_id'])
                         self.storage.save_trade(trade)
                 
                 new_trade, closed_trade = self.bloomberg.check_for_new_events()
-                
                 if new_trade:
                     trade = scrub_trade_details(new_trade)
                     if trade and trade['trade_id'] not in self.tracked_trades:
                         self.tracked_trades.add(trade['trade_id'])
                         self.storage.save_trade(trade)
-                
                 if closed_trade:
                     trade = scrub_trade_details(closed_trade)
                     if trade:
                         trade['current_market_rate'] = self.bloomberg.get_current_rate(trade['currency_pair'])
                         trade['realized_pnl'] = self.calculate_pnl(trade)
                         self.storage.save_trade(trade)
-                
                 time.sleep(30)
             except:
                 time.sleep(5)
@@ -933,8 +877,7 @@ class TeamFXTracker:
             entry = float(trade['execution_rate'])
             current = float(trade['current_market_rate'])
             amount = float(trade['notional_amount'])
-            pnl = (current - entry) * amount if trade['side'] == 'BUY' else (entry - current) * amount
-            return round(pnl, 2)
+            return round((current - entry) * amount if trade['side'] == 'BUY' else (entry - current) * amount, 2)
         except:
             return 0.0
 
@@ -943,33 +886,41 @@ class TeamFXTracker:
 # ============================================================================
 
 def start_flask():
-    app.run(host='127.0.0.1', port=Config.PORT, debug=False, use_reloader=False, threaded=True)
+    socketio.run(app, host='0.0.0.0', port=Config.PORT, debug=False, allow_unsafe_werkzeug=True, use_reloader=False)
 
 def main():
     global tracker_instance
     
     try:
         tracker_instance = TeamFXTracker()
-        
         flask_thread = threading.Thread(target=start_flask, daemon=True)
         flask_thread.start()
-        time.sleep(2)
-        
+        time.sleep(1)  # Faster startup
         tracker_instance.start_monitoring()
         
-        # Create desktop window with sorting and filtering
-        webview.create_window(
-            Config.WINDOW_TITLE,
-            f'http://127.0.0.1:{Config.PORT}',
-            width=Config.WINDOW_WIDTH,
-            height=Config.WINDOW_HEIGHT,
-            resizable=True,
-            min_size=(Config.WINDOW_MIN_WIDTH, Config.WINDOW_MIN_HEIGHT),
-            confirm_close=False
-        )
-        
-        webview.start()
-        
+        if Config.USE_DESKTOP_WINDOW and HAS_WEBVIEW:
+            # Desktop window version
+            webview.create_window(
+                Config.WINDOW_TITLE,
+                f'http://127.0.0.1:{Config.PORT}',
+                width=Config.WINDOW_WIDTH,
+                height=Config.WINDOW_HEIGHT,
+                resizable=True,
+                min_size=(Config.WINDOW_MIN_WIDTH, Config.WINDOW_MIN_HEIGHT)
+            )
+            webview.start()
+        else:
+            # Web browser version
+            import webbrowser
+            print(f"\n{'='*60}\nFX Trade Tracker\nDashboard: http://localhost:{Config.PORT}\n{'='*60}\n")
+            time.sleep(2)
+            webbrowser.open(f'http://localhost:{Config.PORT}')
+            
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                print("\nShutting down...")
     except Exception as e:
         print(f"Error: {e}")
         input("Press Enter to exit...")
