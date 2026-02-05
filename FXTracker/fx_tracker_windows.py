@@ -1,9 +1,9 @@
-# fx_tracker_windows.py - FIXED VERSION
-# Only 4 changes from original:
-# 1. Tick speed: 2s → 1s
-# 2. Fullscreen button added
-# 3. Pips sorting fixed
-# 4. Calculator reset on close
+# fx_tracker_windows.py - FINAL FIXED VERSION
+# Changes from original:
+# 1. Tick speed: 2s → 1s (backend + frontend)
+# 2. Fullscreen button + F11 shortcut
+# 3. Pips sorting actually works now
+# 4. Calculator resets when opened (not on close - that caused crash)
 
 import sys
 import os
@@ -36,7 +36,7 @@ except ImportError:
     input("Press Enter...")
     sys.exit(1)
 
-# Try to import Bloomberg API (will bundle if installed)
+# Try to import Bloomberg API
 try:
     import blpapi
     HAS_BLOOMBERG = True
@@ -110,7 +110,7 @@ class BloombergConnector:
         return None, None
 
 # ============================================================================
-# MOCK DATA - FIXED REALISTIC RATES PER CURRENCY PAIR
+# MOCK DATA
 # ============================================================================
 
 class MockBloombergAPI:
@@ -130,7 +130,6 @@ class MockBloombergAPI:
             'USD/CAD': (1.33, 1.40),
             'NZD/USD': (0.58, 0.64),
         }
-        
         min_rate, max_rate = rate_ranges.get(pair, (1.0, 1.2))
         return round(random.uniform(min_rate, max_rate), 4)
     
@@ -175,12 +174,10 @@ class MockBloombergAPI:
             'NZD/USD': 0.6150
         }
         base = base_rates.get(pair, 1.0)
-        
         if 'JPY' in pair:
             variation = random.uniform(-2.0, 2.0)
         else:
             variation = random.uniform(-0.02, 0.02)
-        
         return round(base + variation, 4)
     
     def maybe_generate_new_trade(self):
@@ -548,7 +545,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
 
     <!-- P&L Calculator Modal -->
-    <div id="calc-modal" class="modal" onclick="if(event.target===this) closeCalcModal()">
+    <div id="calc-modal" class="modal" onclick="if(event.target===this) closeModal('calc-modal')">
         <div class="modal-content">
             <div class="modal-header">📊 P&L & Pip Calculator</div>
             
@@ -608,7 +605,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
             
             <div class="form-actions">
-                <button type="button" class="btn-secondary" onclick="closeCalcModal()">Close</button>
+                <button type="button" class="btn-secondary" onclick="closeModal('calc-modal')">Close</button>
             </div>
         </div>
     </div>
@@ -617,7 +614,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         let allTrades = [], currentFilter = 'all', searchQuery = '', sortColumn = 'timestamp', sortDirection = 'desc';
         let selectedPairs = [], selectedSides = [];
         
-        // FIX #2: Simple fullscreen toggle
         function toggleFullscreen() {
             if (!document.fullscreenElement) {
                 document.documentElement.requestFullscreen();
@@ -659,84 +655,94 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             renderTrades(allTrades);
         }
         
-        function calculatePips(pair, entry, current, side) {
+        function calculatePipsValue(pair, entry, current, side) {
             if (!entry || !current || !pair) return 0;
-            
-            let pipValue = 0.0001;
+            var pipValue = 0.0001;
             if (pair.includes('JPY')) pipValue = 0.01;
-            
-            let pips = (current - entry) / pipValue;
+            var pips = (current - entry) / pipValue;
             if (side === 'SELL') pips = -pips;
-            
             return Math.round(pips * 10) / 10;
         }
         
-        // FIX #3: Calculate pips for sorting (was returning 0 before)
         function getSortValue(t, c) {
             if (c === 'pips') {
-                // Calculate pips on the fly for sorting
-                return calculatePips(t.pair, t.entry_rate, t.current_rate, t.side);
+                return calculatePipsValue(t.pair, t.entry_rate, t.current_rate, t.side);
             }
-            const v = {trade_id: t.trade_id, timestamp: new Date(t.timestamp).getTime(), trader: t.trader || '', pair: t.pair, side: t.side, amount: parseFloat(t.amount), entry_rate: parseFloat(t.entry_rate), current_rate: parseFloat(t.current_rate) || 0, pnl: parseFloat(t.pnl) || 0, counterparty: t.counterparty || '', status: t.status};
+            var v = {
+                trade_id: t.trade_id, 
+                timestamp: new Date(t.timestamp).getTime(), 
+                trader: t.trader || '', 
+                pair: t.pair, 
+                side: t.side, 
+                amount: parseFloat(t.amount), 
+                entry_rate: parseFloat(t.entry_rate), 
+                current_rate: parseFloat(t.current_rate) || 0, 
+                pnl: parseFloat(t.pnl) || 0, 
+                counterparty: t.counterparty || '', 
+                status: t.status
+            };
             return v[c] !== undefined ? v[c] : '';
         }
         
         function matchesFilters(t) {
             if (currentFilter === 'open' && t.status !== 'open') return false;
             if (currentFilter === 'closed' && t.status !== 'closed') return false;
-            if (searchQuery && !`${t.trade_id} ${t.pair} ${t.trader} ${t.counterparty || ''} ${t.side}`.toLowerCase().includes(searchQuery)) return false;
+            if (searchQuery && !(t.trade_id + ' ' + t.pair + ' ' + t.trader + ' ' + (t.counterparty || '') + ' ' + t.side).toLowerCase().includes(searchQuery)) return false;
             if (selectedPairs.length && !selectedPairs.includes(t.pair)) return false;
             if (selectedSides.length && !selectedSides.includes(t.side)) return false;
             return true;
         }
         
         function renderTrades(trades) {
-            const tbody = document.getElementById('tbody');
-            let filtered = trades.filter(matchesFilters);
+            var tbody = document.getElementById('tbody');
+            var filtered = trades.filter(matchesFilters);
             
-            filtered.sort((a, b) => {
-                const aVal = getSortValue(a, sortColumn), bVal = getSortValue(b, sortColumn);
-                return aVal < bVal ? (sortDirection === 'asc' ? -1 : 1) : aVal > bVal ? (sortDirection === 'asc' ? 1 : -1) : 0;
+            filtered.sort(function(a, b) {
+                var aVal = getSortValue(a, sortColumn);
+                var bVal = getSortValue(b, sortColumn);
+                if (aVal < bVal) return sortDirection === 'asc' ? -1 : 1;
+                if (aVal > bVal) return sortDirection === 'asc' ? 1 : -1;
+                return 0;
             });
             
             document.getElementById('count-total').textContent = trades.length;
-            document.getElementById('count-open').textContent = trades.filter(t => t.status === 'open').length;
-            document.getElementById('count-closed').textContent = trades.filter(t => t.status === 'closed').length;
+            document.getElementById('count-open').textContent = trades.filter(function(t) { return t.status === 'open'; }).length;
+            document.getElementById('count-closed').textContent = trades.filter(function(t) { return t.status === 'closed'; }).length;
             document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
             
-            const totalPnL = trades.reduce((s, t) => s + (parseFloat(t.pnl) || 0), 0);
-            const pnlEl = document.getElementById('total-pnl');
+            var totalPnL = trades.reduce(function(s, t) { return s + (parseFloat(t.pnl) || 0); }, 0);
+            var pnlEl = document.getElementById('total-pnl');
             pnlEl.textContent = (totalPnL >= 0 ? '+' : '') + '$' + Math.abs(totalPnL).toLocaleString('en-US', {minimumFractionDigits: 2});
             pnlEl.style.color = totalPnL >= 0 ? '#48bb78' : '#f56565';
             
             tbody.innerHTML = '';
             if (!filtered.length) {
-                tbody.innerHTML = `<tr><td colspan="13" style="text-align: center; padding: 40px; color: #a0aec0;">No matches</td></tr>`;
+                tbody.innerHTML = '<tr><td colspan="13" style="text-align: center; padding: 40px; color: #a0aec0;">No matches</td></tr>';
                 return;
             }
             
             window.filteredTrades = filtered;
-            filtered.forEach((t, i) => {
-                const pnl = parseFloat(t.pnl) || 0;
-                const pips = calculatePips(t.pair, t.entry_rate, t.current_rate, t.side);
-                const time = new Date(t.timestamp).toLocaleString('en-US', {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
+            for (var i = 0; i < filtered.length; i++) {
+                var t = filtered[i];
+                var pnl = parseFloat(t.pnl) || 0;
+                var pips = calculatePipsValue(t.pair, t.entry_rate, t.current_rate, t.side);
+                var time = new Date(t.timestamp).toLocaleString('en-US', {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
                 
-                tbody.insertRow().innerHTML = `
-                    <td><span class="trade-id">${t.trade_id}</span></td>
-                    <td>${time}</td>
-                    <td><span class="trader-badge">${t.trader || 'Unknown'}</span></td>
-                    <td>${t.pair}</td>
-                    <td><span class="side-${t.side.toLowerCase()}">${t.side}</span></td>
-                    <td>${t.amount.toLocaleString('en-US', {maximumFractionDigits: 0})}</td>
-                    <td class="rate-display">${t.entry_rate.toFixed(4)}</td>
-                    <td class="rate-display">${t.current_rate ? t.current_rate.toFixed(4) : '--'}</td>
-                    <td class="${pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}">${pnl >= 0 ? '+' : ''}$${Math.abs(pnl).toLocaleString('en-US', {minimumFractionDigits: 2})}</td>
-                    <td class="${pips >= 0 ? 'pnl-positive' : 'pnl-negative'}">${pips >= 0 ? '+' : ''}${pips.toFixed(1)}</td>
-                    <td><span class="bank-badge">${t.counterparty || 'N/A'}</span></td>
-                    <td><span class="status-${t.status}">${t.status.toUpperCase()}</span></td>
-                    <td><button class="edit-btn" onclick="editTrade(${i})">Edit</button><button class="delete-btn" onclick="deleteTrade('${t.trade_id}')">Del</button></td>
-                `;
-            });
+                var row = tbody.insertRow();
+                row.innerHTML = '<td><span class="trade-id">' + t.trade_id + '</span></td>' +
+                    '<td>' + time + '</td>' +
+                    '<td><span class="trader-badge">' + (t.trader || 'Unknown') + '</span></td>' +
+                    '<td>' + t.pair + '</td>' +
+                    '<td><span class="side-' + t.side.toLowerCase() + '">' + t.side + '</span></td>' +
+                    '<td>' + t.amount.toLocaleString('en-US', {maximumFractionDigits: 0}) + '</td>' +
+                    '<td class="rate-display">' + t.entry_rate.toFixed(4) + '</td>' +
+                    '<td class="rate-display">' + (t.current_rate ? t.current_rate.toFixed(4) : '--') + '</td>' +
+                    '<td class="' + (pnl >= 0 ? 'pnl-positive' : 'pnl-negative') + '">' + (pnl >= 0 ? '+' : '') + '$' + Math.abs(pnl).toLocaleString('en-US', {minimumFractionDigits: 2}) + '</td>' +
+                    '<td class="' + (pips >= 0 ? 'pnl-positive' : 'pnl-negative') + '">' + (pips >= 0 ? '+' : '') + pips.toFixed(1) + '</td>' +
+                    '<td><span class="bank-badge">' + (t.counterparty || 'N/A') + '</span></td>' +
+                    '<td><span class="status-' + t.status + '">' + t.status.toUpperCase() + '</span></td>' +
+                    '<td><button class="edit-btn" onclick="editTrade(' + i + ')">Edit</button><button class="delete-btn" onclick="deleteTrade(\'' + t.trade_id + '\')">Del</button></td>';
+            }
         }
         
         function openAddModal() {
@@ -748,9 +754,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         
         function editTrade(i) {
-            const t = window.filteredTrades[i];
+            var t = window.filteredTrades[i];
             if (!t) return;
-            document.getElementById('modal-title').textContent = `Edit: ${t.trade_id}`;
+            document.getElementById('modal-title').textContent = 'Edit: ' + t.trade_id;
             document.getElementById('trade-id').value = t.trade_id;
             document.getElementById('trade-id').readOnly = false;
             document.getElementById('pair').value = t.pair;
@@ -764,19 +770,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         
         function openCalcModal() {
-            // Reset all fields first
-            resetCalcModal();
-            // Populate trade dropdown
-            const sel = document.getElementById('calc-trade-ref');
-            sel.innerHTML = '<option value="">-- New Calculation --</option>';
-            allTrades.filter(t => t.status === 'open').forEach(t => {
-                sel.innerHTML += `<option value="${t.trade_id}">${t.trade_id} - ${t.pair} ${t.side} ${t.amount.toLocaleString()}</option>`;
-            });
-            document.getElementById('calc-modal').classList.add('active');
-        }
-        
-        // FIX #4: Reset calculator when closing
-        function resetCalcModal() {
+            // Reset all fields when opening
             document.getElementById('calc-trade-ref').value = '';
             document.getElementById('calc-pair').value = '';
             document.getElementById('calc-side').value = '';
@@ -787,15 +781,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             document.getElementById('calc-pnl-result').style.color = '#2d3748';
             document.getElementById('calc-pips-result').textContent = '0.0';
             document.getElementById('calc-pips-result').style.color = '#2d3748';
-        }
-        
-        function closeCalcModal() {
-            resetCalcModal();
-            document.getElementById('calc-modal').classList.remove('active');
+            
+            // Populate trade dropdown
+            var sel = document.getElementById('calc-trade-ref');
+            sel.innerHTML = '<option value="">-- New Calculation --</option>';
+            for (var i = 0; i < allTrades.length; i++) {
+                var t = allTrades[i];
+                if (t.status === 'open') {
+                    sel.innerHTML += '<option value="' + t.trade_id + '">' + t.trade_id + ' - ' + t.pair + ' ' + t.side + ' ' + t.amount.toLocaleString() + '</option>';
+                }
+            }
+            document.getElementById('calc-modal').classList.add('active');
         }
         
         function loadTradeToCalc() {
-            const id = document.getElementById('calc-trade-ref').value;
+            var id = document.getElementById('calc-trade-ref').value;
             if (!id) {
                 document.getElementById('calc-pair').value = '';
                 document.getElementById('calc-side').value = '';
@@ -806,7 +806,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 return;
             }
             
-            const trade = allTrades.find(t => t.trade_id === id);
+            var trade = null;
+            for (var i = 0; i < allTrades.length; i++) {
+                if (allTrades[i].trade_id === id) {
+                    trade = allTrades[i];
+                    break;
+                }
+            }
             if (trade) {
                 document.getElementById('calc-pair').value = trade.pair;
                 document.getElementById('calc-side').value = trade.side;
@@ -818,11 +824,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         
         function calculatePnL() {
-            const pair = document.getElementById('calc-pair').value;
-            const side = document.getElementById('calc-side').value;
-            const amount = parseFloat(document.getElementById('calc-amount').value) || 0;
-            const entry = parseFloat(document.getElementById('calc-entry').value) || 0;
-            const exit = parseFloat(document.getElementById('calc-exit').value) || 0;
+            var pair = document.getElementById('calc-pair').value;
+            var side = document.getElementById('calc-side').value;
+            var amount = parseFloat(document.getElementById('calc-amount').value) || 0;
+            var entry = parseFloat(document.getElementById('calc-entry').value) || 0;
+            var exit = parseFloat(document.getElementById('calc-exit').value) || 0;
             
             if (!pair || !side || !amount || !entry || !exit) {
                 document.getElementById('calc-pnl-result').textContent = '$0.00';
@@ -830,20 +836,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 return;
             }
             
-            let pnl = 0;
+            var pnl = 0;
             if (side === 'BUY') {
                 pnl = (exit - entry) * amount;
             } else {
                 pnl = (entry - exit) * amount;
             }
             
-            const pips = calculatePips(pair, entry, exit, side);
+            var pips = calculatePipsValue(pair, entry, exit, side);
             
-            const pnlEl = document.getElementById('calc-pnl-result');
+            var pnlEl = document.getElementById('calc-pnl-result');
             pnlEl.textContent = (pnl >= 0 ? '+' : '') + '$' + Math.abs(pnl).toLocaleString('en-US', {minimumFractionDigits: 2});
             pnlEl.style.color = pnl >= 0 ? '#48bb78' : '#f56565';
             
-            const pipsEl = document.getElementById('calc-pips-result');
+            var pipsEl = document.getElementById('calc-pips-result');
             pipsEl.textContent = (pips >= 0 ? '+' : '') + pips.toFixed(1);
             pipsEl.style.color = pips >= 0 ? '#48bb78' : '#f56565';
         }
@@ -854,10 +860,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         
         function saveTrade(e) {
             e.preventDefault();
-            const pair = document.getElementById('pair').value;
-            const currencies = pair.split('/');
+            var pair = document.getElementById('pair').value;
+            var currencies = pair.split('/');
             
-            const data = {
+            var data = {
                 trade_id: document.getElementById('trade-id').value.trim(),
                 timestamp: new Date().toISOString(),
                 currency_pair: pair,
@@ -874,31 +880,31 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             };
             
             fetch('/api/trade', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)})
-            .then(r => r.json())
-            .then(d => { if (d.success) { closeModal('trade-modal'); setTimeout(updateTrades, 100); } else alert('Error: ' + (d.error || 'Unknown')); })
-            .catch(err => alert('Error: ' + err));
+            .then(function(r) { return r.json(); })
+            .then(function(d) { if (d.success) { closeModal('trade-modal'); setTimeout(updateTrades, 100); } else alert('Error: ' + (d.error || 'Unknown')); })
+            .catch(function(err) { alert('Error: ' + err); });
         }
         
         function deleteTrade(id) {
-            if (!confirm(`Delete ${id}?`)) return;
+            if (!confirm('Delete ' + id + '?')) return;
             fetch('/api/trade/' + id, {method: 'DELETE'})
-            .then(r => r.json())
-            .then(d => { if (d.success) setTimeout(updateTrades, 100); })
-            .catch(err => alert('Error'));
+            .then(function(r) { return r.json(); })
+            .then(function(d) { if (d.success) setTimeout(updateTrades, 100); })
+            .catch(function(err) { alert('Error'); });
         }
         
         function updateStatus() {
-            fetch('/api/status').then(r => r.json()).then(d => document.getElementById('status').textContent = d.status).catch(() => {});
+            fetch('/api/status').then(function(r) { return r.json(); }).then(function(d) { document.getElementById('status').textContent = d.status; }).catch(function() {});
         }
         
         function updateTrades() {
-            fetch('/api/trades').then(r => r.json()).then(trades => { allTrades = trades; renderTrades(trades); }).catch(() => {});
+            fetch('/api/trades').then(function(r) { return r.json(); }).then(function(trades) { allTrades = trades; renderTrades(trades); }).catch(function() {});
         }
         
-        document.addEventListener('keydown', e => { 
+        document.addEventListener('keydown', function(e) { 
             if (e.key === 'Escape') { 
                 closeModal('trade-modal'); 
-                closeCalcModal(); 
+                closeModal('calc-modal'); 
             }
             if (e.key === 'F11') {
                 e.preventDefault();
@@ -909,7 +915,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         updateStatus();
         updateTrades();
         setInterval(updateStatus, 5000);
-        setInterval(updateTrades, 1000);  // FIX #1: Changed from 2000 to 1000 (1 second)
+        setInterval(updateTrades, 1000);
     </script>
 </body>
 </html>"""
@@ -1015,7 +1021,7 @@ class TeamFXTracker:
                     trade['current_market_rate'] = self.bloomberg.get_current_rate(trade['currency_pair'])
                     trade['unrealized_pnl'] = self.calculate_pnl(trade)
                     self.storage.save_trade(trade)
-                time.sleep(1)  # FIX #1: Changed from 2 to 1 second
+                time.sleep(1)
             except:
                 time.sleep(5)
     
