@@ -15,6 +15,7 @@ import threading
 import time
 import random
 import sqlite3
+import uuid
 from datetime import datetime, timedelta
 
 # ============================================================================
@@ -124,7 +125,6 @@ class MockBloombergAPI:
     
     def _generate_trade_id(self):
         """Generate unique trade ID using timestamp + random number"""
-        import uuid
         return f'FX{datetime.now().strftime("%Y%m%d")}{uuid.uuid4().hex[:6].upper()}'
     
     def get_realistic_rate(self, pair):
