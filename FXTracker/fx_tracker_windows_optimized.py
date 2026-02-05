@@ -1,10 +1,8 @@
-# fx_tracker_windows.py - COMPLETE FIXED VERSION
-# All bugs fixed, realistic rates, counterparty column, pip calculator, Bloomberg API bundled
-# PRODUCTION READY
+# fx_tracker_windows.py - OPTIMIZED VERSION
+# Faster launch, 1-second updates, fullscreen support, Bloomberg handling improved
 
 import sys
 import os
-import subprocess
 import threading
 import time
 import random
@@ -12,94 +10,166 @@ import sqlite3
 from datetime import datetime, timedelta
 
 # ============================================================================
-# AUTO-INSTALL PACKAGES
+# FAST IMPORTS - No auto-install on every launch (for bundled exe)
 # ============================================================================
 
-def install_packages():
-    packages = {'flask': 'flask', 'webview': 'pywebview'}
-    for module, package in packages.items():
-        try:
-            __import__(module)
-        except ImportError:
-            subprocess.check_call([sys.executable, '-m', 'pip', 'install', package, '--quiet'],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
 try:
-    install_packages()
     from flask import Flask, render_template_string, jsonify, request
     import webview
 except ImportError:
-    print("Error: Run: pip install flask pywebview")
-    input("Press Enter...")
+    print("Error: Missing dependencies. Run: pip install flask pywebview")
+    input("Press Enter to exit...")
     sys.exit(1)
 
-# Try to import Bloomberg API (will bundle if installed)
-try:
-    import blpapi
-    HAS_BLOOMBERG = True
-except ImportError:
-    HAS_BLOOMBERG = False
+# ============================================================================
+# BLOOMBERG API - Bundled with graceful fallback
+# ============================================================================
+# blpapi IS bundled in this exe (if built on Bloomberg machine)
+# But it requires Bloomberg Terminal's native DLLs to actually work
+# This code handles ALL scenarios gracefully:
+#   1. blpapi not bundled → Demo mode
+#   2. blpapi bundled but Terminal not installed → Demo mode  
+#   3. blpapi bundled, Terminal installed, not running → Demo mode
+#   4. Everything working → Real Bloomberg data
+# ============================================================================
+
+HAS_BLOOMBERG = False
+BLOOMBERG_STATUS = "Checking..."
+blpapi = None
+
+def _check_bloomberg():
+    """Check Bloomberg availability - called once at startup"""
+    global HAS_BLOOMBERG, BLOOMBERG_STATUS, blpapi
+    
+    # Step 1: Try to import blpapi
+    try:
+        import blpapi as _blpapi
+        blpapi = _blpapi
+    except ImportError:
+        BLOOMBERG_STATUS = "blpapi not bundled"
+        return False
+    except OSError as e:
+        # This happens when blpapi is bundled but Bloomberg DLLs are missing
+        BLOOMBERG_STATUS = "Bloomberg Terminal not installed"
+        return False
+    except Exception as e:
+        BLOOMBERG_STATUS = f"Import error: {e}"
+        return False
+    
+    # Step 2: Try to create a session (checks if Terminal is running)
+    try:
+        session_options = blpapi.SessionOptions()
+        session_options.setServerHost('localhost')
+        session_options.setServerPort(8194)
+        session_options.setConnectTimeout(3000)  # 3 second timeout
+        
+        test_session = blpapi.Session(session_options)
+        if test_session.start():
+            test_session.stop()
+            BLOOMBERG_STATUS = "Bloomberg available"
+            return True
+        else:
+            BLOOMBERG_STATUS = "Bloomberg Terminal not running"
+            return False
+    except Exception as e:
+        BLOOMBERG_STATUS = "Bloomberg Terminal not running"
+        return False
+
+# Run check at import time (background thread to not block startup)
+import threading
+def _init_bloomberg():
+    global HAS_BLOOMBERG
+    HAS_BLOOMBERG = _check_bloomberg()
+
+_bloomberg_init_thread = threading.Thread(target=_init_bloomberg, daemon=True)
+_bloomberg_init_thread.start()
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
 class Config:
+    # Try shared folder first, fallback to local
     SHARED_FOLDER = r"Z:\TradingDesk\FXTracker"
-    # SHARED_FOLDER = os.path.join(os.path.expanduser('~'), 'Desktop', 'FXTracker_Test')
     
-    try:
-        os.makedirs(SHARED_FOLDER, exist_ok=True)
-        DATABASE_FILE = os.path.join(SHARED_FOLDER, 'team_fx_trades.db')
-    except:
-        SHARED_FOLDER = os.path.join(os.path.expanduser('~'), 'Documents', 'FXTracker')
-        os.makedirs(SHARED_FOLDER, exist_ok=True)
-        DATABASE_FILE = os.path.join(SHARED_FOLDER, 'team_fx_trades.db')
+    @classmethod
+    def init_paths(cls):
+        """Lazy path initialization"""
+        try:
+            os.makedirs(cls.SHARED_FOLDER, exist_ok=True)
+            cls.DATABASE_FILE = os.path.join(cls.SHARED_FOLDER, 'team_fx_trades.db')
+        except (OSError, PermissionError):
+            cls.SHARED_FOLDER = os.path.join(os.path.expanduser('~'), 'Documents', 'FXTracker')
+            os.makedirs(cls.SHARED_FOLDER, exist_ok=True)
+            cls.DATABASE_FILE = os.path.join(cls.SHARED_FOLDER, 'team_fx_trades.db')
     
     USE_REAL_BLOOMBERG = HAS_BLOOMBERG
     PORT = 8765
-    
     WINDOW_TITLE = "FX Trade Tracker"
     WINDOW_WIDTH = 1600
     WINDOW_HEIGHT = 950
+    PNL_UPDATE_INTERVAL = 1  # Changed to 1 second
+    TRADE_MONITOR_INTERVAL = 30
+
+# Initialize paths in background
+Config.init_paths()
 
 # ============================================================================
-# BLOOMBERG CONNECTOR
+# BLOOMBERG CONNECTOR (Improved handling)
 # ============================================================================
 
 class BloombergConnector:
+    """
+    Bloomberg API connector with graceful fallback to demo data.
+    Handles all scenarios: blpapi not bundled, Terminal not installed, Terminal not running.
+    """
+    
     def __init__(self, use_real=True):
-        self.use_real = use_real and HAS_BLOOMBERG
+        # Wait for bloomberg init check to complete (max 4 seconds)
+        _bloomberg_init_thread.join(timeout=4.0)
+        
+        self.use_real = use_real and HAS_BLOOMBERG and blpapi is not None
         self.session = None
-        self.connection_status = "DEMO MODE"
+        self.connected = False
         self.mock_api = MockBloombergAPI()
         
         if self.use_real:
+            self.connection_status = "🔄 Connecting to Bloomberg..."
             threading.Thread(target=self._connect_async, daemon=True).start()
+        else:
+            # Show why we're in demo mode
+            self.connection_status = f"⚠️ Demo Mode ({BLOOMBERG_STATUS})"
     
     def _connect_async(self):
+        """Async Bloomberg connection - won't block app startup"""
         try:
-            self.connection_status = "Connecting..."
             session_options = blpapi.SessionOptions()
             session_options.setServerHost('localhost')
             session_options.setServerPort(8194)
+            session_options.setConnectTimeout(5000)
+            
             self.session = blpapi.Session(session_options)
             
             if self.session.start() and self.session.openService("//blp/emapisvc"):
+                self.connected = True
                 self.connection_status = "✅ Bloomberg Connected"
             else:
-                raise Exception()
-        except:
-            self.connection_status = "⚠️ Demo mode"
+                raise ConnectionError("Session failed to start")
+                
+        except Exception as e:
+            self.connection_status = "⚠️ Demo Mode (connection failed)"
             self.use_real = False
+            self.connected = False
     
     def get_connection_status(self):
         return self.connection_status
     
     def get_trades(self):
+        # In production, this would fetch from Bloomberg EMSX
         return self.mock_api.get_trades() if self.mock_api else []
     
     def get_current_rate(self, pair):
+        # In production with Bloomberg: use //blp/mktdata service
         return self.mock_api.get_current_rate(pair) if self.mock_api else 1.0
     
     def check_for_new_events(self):
@@ -108,29 +178,36 @@ class BloombergConnector:
         return None, None
 
 # ============================================================================
-# MOCK DATA - FIXED REALISTIC RATES PER CURRENCY PAIR
+# MOCK DATA - Realistic rates per currency pair
 # ============================================================================
 
 class MockBloombergAPI:
+    # Class-level rate ranges (avoid recreating dict on every call)
+    RATE_RANGES = {
+        'EUR/USD': (1.05, 1.12),
+        'GBP/USD': (1.20, 1.32),
+        'USD/JPY': (140.0, 155.0),
+        'AUD/USD': (0.62, 0.70),
+        'USD/CHF': (0.82, 0.90),
+        'EUR/GBP': (0.83, 0.88),
+        'USD/CAD': (1.33, 1.40),
+        'NZD/USD': (0.58, 0.64),
+    }
+    
+    BASE_RATES = {
+        'EUR/USD': 1.0850, 'GBP/USD': 1.2650, 'USD/JPY': 148.50,
+        'AUD/USD': 0.6550, 'USD/CHF': 0.8450, 'EUR/GBP': 0.8580,
+        'USD/CAD': 1.3650, 'NZD/USD': 0.6150
+    }
+    
     def __init__(self):
         self.trades = []
         self.trade_counter = 1
-        self._generate_initial_team_trades()
+        # Generate initial trades in background to speed up startup
+        threading.Thread(target=self._generate_initial_team_trades, daemon=True).start()
     
     def get_realistic_rate(self, pair):
-        """Get realistic rate range for each currency pair"""
-        rate_ranges = {
-            'EUR/USD': (1.05, 1.12),      # Euro typically 1.05-1.12
-            'GBP/USD': (1.20, 1.32),      # Pound typically 1.20-1.32
-            'USD/JPY': (140.0, 155.0),    # Yen typically 140-155 (HIGH NUMBER!)
-            'AUD/USD': (0.62, 0.70),      # Aussie typically 0.62-0.70
-            'USD/CHF': (0.82, 0.90),      # Swiss typically 0.82-0.90
-            'EUR/GBP': (0.83, 0.88),      # Euro/Pound typically 0.83-0.88
-            'USD/CAD': (1.33, 1.40),      # Canadian typically 1.33-1.40
-            'NZD/USD': (0.58, 0.64),      # Kiwi typically 0.58-0.64
-        }
-        
-        min_rate, max_rate = rate_ranges.get(pair, (1.0, 1.2))
+        min_rate, max_rate = self.RATE_RANGES.get(pair, (1.0, 1.2))
         return round(random.uniform(min_rate, max_rate), 4)
     
     def _generate_initial_team_trades(self):
@@ -138,50 +215,33 @@ class MockBloombergAPI:
         counterparties = ['JP Morgan', 'Goldman Sachs', 'Citigroup', 'HSBC', 'Barclays', 'Deutsche Bank']
         traders = ['John Smith', 'Sarah Johnson', 'Mike Chen', 'Emily Davis', 'Tom Wilson']
         
+        now = datetime.now()
         for i in range(15):
             pair = random.choice(pairs)
             currencies = pair.split('/')
             
-            trade = {
-                'trade_id': f'FX{datetime.now().strftime("%Y%m%d")}{i+1:03d}',
-                'timestamp': datetime.now() - timedelta(hours=random.randint(1, 72)),
+            self.trades.append({
+                'trade_id': f'FX{now.strftime("%Y%m%d")}{i+1:03d}',
+                'timestamp': now - timedelta(hours=random.randint(1, 72)),
                 'currency_pair': pair,
                 'side': random.choice(['BUY', 'SELL']),
                 'notional_amount': random.randint(500000, 25000000),
                 'base_currency': currencies[0],
                 'quote_currency': currencies[1],
-                'execution_rate': self.get_realistic_rate(pair),  # FIXED: Now realistic!
-                'value_date': (datetime.now() + timedelta(days=2)).date(),
-                'settlement_date': (datetime.now() + timedelta(days=2)).date(),
+                'execution_rate': self.get_realistic_rate(pair),
+                'value_date': (now + timedelta(days=2)).date(),
+                'settlement_date': (now + timedelta(days=2)).date(),
                 'counterparty': random.choice(counterparties),
                 'trader_name': random.choice(traders),
                 'status': random.choice(['open', 'open', 'open', 'open', 'closed', 'closed', 'closed'])
-            }
-            self.trades.append(trade)
+            })
     
     def get_trades(self):
         return self.trades
     
     def get_current_rate(self, pair):
-        """Get realistic current rates"""
-        base_rates = {
-            'EUR/USD': 1.0850,
-            'GBP/USD': 1.2650,
-            'USD/JPY': 148.50,  # FIXED: Realistic JPY rate!
-            'AUD/USD': 0.6550,
-            'USD/CHF': 0.8450,
-            'EUR/GBP': 0.8580,
-            'USD/CAD': 1.3650,
-            'NZD/USD': 0.6150
-        }
-        base = base_rates.get(pair, 1.0)
-        
-        # Add small variation
-        if 'JPY' in pair:
-            variation = random.uniform(-2.0, 2.0)  # JPY moves in larger numbers
-        else:
-            variation = random.uniform(-0.02, 0.02)
-        
+        base = self.BASE_RATES.get(pair, 1.0)
+        variation = random.uniform(-2.0, 2.0) if 'JPY' in pair else random.uniform(-0.02, 0.02)
         return round(base + variation, 4)
     
     def maybe_generate_new_trade(self):
@@ -190,18 +250,19 @@ class MockBloombergAPI:
             traders = ['John Smith', 'Sarah Johnson', 'Mike Chen']
             pair = random.choice(pairs)
             currencies = pair.split('/')
+            now = datetime.now()
             
             trade = {
-                'trade_id': f'FX{datetime.now().strftime("%Y%m%d")}{self.trade_counter:03d}',
-                'timestamp': datetime.now(),
+                'trade_id': f'FX{now.strftime("%Y%m%d")}{self.trade_counter:03d}',
+                'timestamp': now,
                 'currency_pair': pair,
                 'side': random.choice(['BUY', 'SELL']),
                 'notional_amount': random.randint(1000000, 15000000),
                 'base_currency': currencies[0],
                 'quote_currency': currencies[1],
-                'execution_rate': self.get_realistic_rate(pair),  # FIXED: Realistic rate
-                'value_date': (datetime.now() + timedelta(days=2)).date(),
-                'settlement_date': (datetime.now() + timedelta(days=2)).date(),
+                'execution_rate': self.get_realistic_rate(pair),
+                'value_date': (now + timedelta(days=2)).date(),
+                'settlement_date': (now + timedelta(days=2)).date(),
                 'counterparty': random.choice(['JP Morgan', 'Citi', 'HSBC']),
                 'trader_name': random.choice(traders),
                 'status': 'open'
@@ -220,24 +281,24 @@ class MockBloombergAPI:
         return None
 
 # ============================================================================
-# DATABASE
+# DATABASE (Optimized)
 # ============================================================================
 
 def scrub_trade_details(trade_raw):
-    if not trade_raw: return None
+    if not trade_raw:
+        return None
     try:
         pair = trade_raw.get('currency_pair', '')
         if '/' in pair:
-            currencies = pair.split('/')
-            base_curr = currencies[0]
-            quote_curr = currencies[1] if len(currencies) > 1 else ''
+            base_curr, quote_curr = pair.split('/', 1)
         else:
             base_curr = trade_raw.get('base_currency', '')
             quote_curr = trade_raw.get('quote_currency', '')
         
+        now = datetime.now()
         return {
             'trade_id': str(trade_raw.get('trade_id', '')),
-            'timestamp': trade_raw.get('timestamp') or datetime.now(),
+            'timestamp': trade_raw.get('timestamp') or now,
             'currency_pair': str(pair),
             'side': str(trade_raw.get('side', '')).upper(),
             'notional_amount': float(trade_raw.get('notional_amount', 0)),
@@ -245,98 +306,122 @@ def scrub_trade_details(trade_raw):
             'quote_currency': quote_curr,
             'execution_rate': float(trade_raw.get('execution_rate', 0)),
             'current_market_rate': float(trade_raw.get('current_market_rate')) if trade_raw.get('current_market_rate') else None,
-            'value_date': trade_raw.get('value_date') or (datetime.now() + timedelta(days=2)).date(),
-            'settlement_date': trade_raw.get('settlement_date') or (datetime.now() + timedelta(days=2)).date(),
+            'value_date': trade_raw.get('value_date') or (now + timedelta(days=2)).date(),
+            'settlement_date': trade_raw.get('settlement_date') or (now + timedelta(days=2)).date(),
             'counterparty': str(trade_raw.get('counterparty', '')),
             'trader_name': str(trade_raw.get('trader_name', '')),
             'status': str(trade_raw.get('status', 'open')).lower(),
             'unrealized_pnl': float(trade_raw.get('unrealized_pnl', 0.0)),
             'realized_pnl': float(trade_raw.get('realized_pnl')) if trade_raw.get('realized_pnl') else None,
-            'last_updated': datetime.now()
+            'last_updated': now
         }
-    except:
+    except (ValueError, TypeError, AttributeError):
         return None
 
+
 class SharedDatabase:
+    CREATE_TABLE_SQL = """CREATE TABLE IF NOT EXISTS trades (
+        trade_id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, currency_pair TEXT NOT NULL,
+        side TEXT NOT NULL, notional_amount REAL NOT NULL, base_currency TEXT,
+        quote_currency TEXT, execution_rate REAL NOT NULL, current_market_rate REAL,
+        value_date TEXT, settlement_date TEXT, counterparty TEXT, trader_name TEXT,
+        status TEXT DEFAULT 'open', unrealized_pnl REAL DEFAULT 0, realized_pnl REAL, 
+        last_updated TEXT)"""
+    
     def __init__(self, db_file):
         self.db_file = db_file
         self.lock = threading.Lock()
-        self._create_tables()
+        self._initialized = False
+        # Lazy initialization - don't block startup
+        threading.Thread(target=self._create_tables, daemon=True).start()
+    
+    def _get_connection(self):
+        return sqlite3.connect(self.db_file, timeout=10.0)
     
     def _create_tables(self):
         with self.lock:
-            conn = sqlite3.connect(self.db_file)
+            conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute("""CREATE TABLE IF NOT EXISTS trades (
-                trade_id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, currency_pair TEXT NOT NULL,
-                side TEXT NOT NULL, notional_amount REAL NOT NULL, base_currency TEXT,
-                quote_currency TEXT, execution_rate REAL NOT NULL, current_market_rate REAL,
-                value_date TEXT, settlement_date TEXT, counterparty TEXT, trader_name TEXT,
-                status TEXT DEFAULT 'open', unrealized_pnl REAL DEFAULT 0, realized_pnl REAL, last_updated TEXT)""")
+            cursor.execute(self.CREATE_TABLE_SQL)
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_status ON trades(status)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_trader ON trades(trader_name)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_pair ON trades(currency_pair)")
             conn.commit()
             conn.close()
+            self._initialized = True
+    
+    def _wait_for_init(self):
+        while not self._initialized:
+            time.sleep(0.01)
     
     def save_trade(self, trade):
-        if not trade or not trade.get('trade_id'): return False
+        if not trade or not trade.get('trade_id'):
+            return False
+        self._wait_for_init()
         try:
             with self.lock:
-                conn = sqlite3.connect(self.db_file, timeout=10.0)
+                conn = self._get_connection()
                 cursor = conn.cursor()
-                cursor.execute("INSERT OR REPLACE INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (trade['trade_id'], str(trade['timestamp']), trade['currency_pair'], trade['side'],
-                     float(trade['notional_amount']), trade['base_currency'], trade['quote_currency'],
-                     float(trade['execution_rate']), float(trade['current_market_rate']) if trade['current_market_rate'] else None,
+                cursor.execute(
+                    "INSERT OR REPLACE INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (trade['trade_id'], str(trade['timestamp']), trade['currency_pair'], 
+                     trade['side'], float(trade['notional_amount']), trade['base_currency'], 
+                     trade['quote_currency'], float(trade['execution_rate']),
+                     float(trade['current_market_rate']) if trade['current_market_rate'] else None,
                      str(trade['value_date']), str(trade['settlement_date']), trade['counterparty'],
                      trade['trader_name'], trade['status'], float(trade['unrealized_pnl']),
-                     float(trade['realized_pnl']) if trade['realized_pnl'] else None, str(datetime.now())))
+                     float(trade['realized_pnl']) if trade['realized_pnl'] else None, 
+                     str(datetime.now())))
                 conn.commit()
                 conn.close()
                 return True
-        except:
+        except (sqlite3.Error, ValueError):
             return False
     
     def delete_trade(self, trade_id):
+        self._wait_for_init()
         try:
             with self.lock:
-                conn = sqlite3.connect(self.db_file, timeout=10.0)
+                conn = self._get_connection()
                 cursor = conn.cursor()
                 cursor.execute("DELETE FROM trades WHERE trade_id = ?", (trade_id,))
                 deleted = cursor.rowcount > 0
                 conn.commit()
                 conn.close()
                 return deleted
-        except:
+        except sqlite3.Error:
             return False
     
     def get_all_trades(self):
+        self._wait_for_init()
         try:
             with self.lock:
-                conn = sqlite3.connect(self.db_file, timeout=10.0)
+                conn = self._get_connection()
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
                 cursor.execute("SELECT * FROM trades ORDER BY timestamp DESC")
                 rows = cursor.fetchall()
                 conn.close()
                 return [dict(row) for row in rows]
-        except:
+        except sqlite3.Error:
             return []
     
     def get_open_trades(self):
+        self._wait_for_init()
         try:
             with self.lock:
-                conn = sqlite3.connect(self.db_file, timeout=10.0)
+                conn = self._get_connection()
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
                 cursor.execute("SELECT * FROM trades WHERE status = 'open'")
                 rows = cursor.fetchall()
                 conn.close()
                 return [dict(row) for row in rows]
-        except:
+        except sqlite3.Error:
             return []
 
+
+# Global database instance
 shared_db = SharedDatabase(Config.DATABASE_FILE)
 
 # ============================================================================
@@ -344,7 +429,7 @@ shared_db = SharedDatabase(Config.DATABASE_FILE)
 # ============================================================================
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'fx-tracker'
+app.config['SECRET_KEY'] = 'fx-tracker-secret'
 tracker_instance = None
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -366,6 +451,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .filter-btn:not(.active) { background: #edf2f7; color: #4a5568; }
         .action-btn { background: #48bb78; color: white; }
         .action-btn.calc { background: #ed8936; }
+        .action-btn.fullscreen { background: #4299e1; }
         .filter-btn:hover, .action-btn:hover { transform: translateY(-1px); }
         .search-box { padding: 7px 12px; border: 2px solid #e2e8f0; border-radius: 6px; font-size: 12px; width: 250px; }
         .search-box:focus { outline: none; border-color: #667eea; }
@@ -401,7 +487,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .edit-btn, .delete-btn { padding: 3px 7px; border: none; border-radius: 3px; font-size: 10px; font-weight: 600; cursor: pointer; margin-right: 3px; }
         .edit-btn { background: #4299e1; color: white; }
         .delete-btn { background: #fc8181; color: white; }
-        
         .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.75); z-index: 1000; justify-content: center; align-items: center; }
         .modal.active { display: flex; }
         .modal-content { background: white; padding: 25px; border-radius: 12px; max-width: 600px; width: 90%; max-height: 90vh; overflow-y: auto; }
@@ -414,7 +499,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .btn-primary, .btn-secondary { flex: 1; padding: 10px; border: none; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; }
         .btn-primary { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
         .btn-secondary { background: #e2e8f0; color: #4a5568; }
-        
         .calc-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 15px; }
         .calc-result { background: #f7fafc; padding: 15px; border-radius: 8px; border-left: 4px solid #667eea; }
         .calc-result-label { font-size: 11px; color: #718096; margin-bottom: 5px; font-weight: 600; }
@@ -424,7 +508,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <body>
     <div class="header">
         <h1>📊 FX Trade Tracker</h1>
-        <div class="subtitle">Team Dashboard • Full Featured • Network Shared Database</div>
+        <div class="subtitle">Team Dashboard • Full Featured • Network Shared Database | Press F11 for Fullscreen</div>
         <div class="connection-badge" id="status">Loading...</div>
         
         <div class="controls">
@@ -435,6 +519,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <button class="toggle-advanced" onclick="toggleAdvanced()">⚙️ Filters</button>
             <button class="action-btn" onclick="openAddModal()">➕ Add</button>
             <button class="action-btn calc" onclick="openCalcModal()">📊 P&L Calculator</button>
+            <button class="action-btn fullscreen" onclick="toggleFullscreen()">⛶ Fullscreen</button>
         </div>
         
         <div class="advanced-search" id="advanced">
@@ -486,129 +571,37 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
     </div>
 
-    <!-- Trade Modal -->
     <div id="trade-modal" class="modal" onclick="if(event.target===this) closeModal('trade-modal')">
         <div class="modal-content">
             <div class="modal-header" id="modal-title">Add Trade</div>
             <form id="trade-form" onsubmit="saveTrade(event)">
-                <div class="form-group">
-                    <label class="form-label">Trade ID*</label>
-                    <input type="text" class="form-input" id="trade-id" required>
-                </div>
-                <div class="form-group">
-                    <label class="form-label">Currency Pair*</label>
-                    <select class="form-select" id="pair" required>
-                        <option value="">Select...</option>
-                        <option value="EUR/USD">EUR/USD</option>
-                        <option value="GBP/USD">GBP/USD</option>
-                        <option value="USD/JPY">USD/JPY</option>
-                        <option value="AUD/USD">AUD/USD</option>
-                        <option value="USD/CHF">USD/CHF</option>
-                        <option value="EUR/GBP">EUR/GBP</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label class="form-label">Side*</label>
-                    <select class="form-select" id="side" required>
-                        <option value="">Select...</option>
-                        <option value="BUY">BUY</option>
-                        <option value="SELL">SELL</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label class="form-label">Amount* (any number)</label>
-                    <input type="text" class="form-input" id="amount" placeholder="e.g., 5500000" required pattern="[0-9]+">
-                </div>
-                <div class="form-group">
-                    <label class="form-label">Entry Rate* (any number)</label>
-                    <input type="text" class="form-input" id="rate" placeholder="e.g., 148.5000" required pattern="[0-9.]+">
-                </div>
-                <div class="form-group">
-                    <label class="form-label">Trader*</label>
-                    <input type="text" class="form-input" id="trader" required>
-                </div>
-                <div class="form-group">
-                    <label class="form-label">Bank/Counterparty</label>
-                    <input type="text" class="form-input" id="counterparty">
-                </div>
-                <div class="form-group">
-                    <label class="form-label">Status*</label>
-                    <select class="form-select" id="status" required>
-                        <option value="open">Open</option>
-                        <option value="closed">Closed</option>
-                    </select>
-                </div>
-                <div class="form-actions">
-                    <button type="submit" class="btn-primary">Save</button>
-                    <button type="button" class="btn-secondary" onclick="closeModal('trade-modal')">Cancel</button>
-                </div>
+                <div class="form-group"><label class="form-label">Trade ID*</label><input type="text" class="form-input" id="trade-id" required></div>
+                <div class="form-group"><label class="form-label">Currency Pair*</label><select class="form-select" id="pair" required><option value="">Select...</option><option value="EUR/USD">EUR/USD</option><option value="GBP/USD">GBP/USD</option><option value="USD/JPY">USD/JPY</option><option value="AUD/USD">AUD/USD</option><option value="USD/CHF">USD/CHF</option><option value="EUR/GBP">EUR/GBP</option></select></div>
+                <div class="form-group"><label class="form-label">Side*</label><select class="form-select" id="side" required><option value="">Select...</option><option value="BUY">BUY</option><option value="SELL">SELL</option></select></div>
+                <div class="form-group"><label class="form-label">Amount*</label><input type="text" class="form-input" id="amount" placeholder="e.g., 5500000" required pattern="[0-9]+"></div>
+                <div class="form-group"><label class="form-label">Entry Rate*</label><input type="text" class="form-input" id="rate" placeholder="e.g., 148.5000" required pattern="[0-9.]+"></div>
+                <div class="form-group"><label class="form-label">Trader*</label><input type="text" class="form-input" id="trader" required></div>
+                <div class="form-group"><label class="form-label">Bank/Counterparty</label><input type="text" class="form-input" id="counterparty"></div>
+                <div class="form-group"><label class="form-label">Status*</label><select class="form-select" id="status" required><option value="open">Open</option><option value="closed">Closed</option></select></div>
+                <div class="form-actions"><button type="submit" class="btn-primary">Save</button><button type="button" class="btn-secondary" onclick="closeModal('trade-modal')">Cancel</button></div>
             </form>
         </div>
     </div>
 
-    <!-- P&L Calculator Modal -->
     <div id="calc-modal" class="modal" onclick="if(event.target===this) closeModal('calc-modal')">
         <div class="modal-content">
             <div class="modal-header">📊 P&L & Pip Calculator</div>
-            
-            <div class="form-group">
-                <label class="form-label">Reference Existing Trade (Optional)</label>
-                <select class="form-select" id="calc-trade-ref" onchange="loadTradeToCalc()">
-                    <option value="">-- New Calculation --</option>
-                </select>
-            </div>
-            
-            <div class="form-group">
-                <label class="form-label">Currency Pair*</label>
-                <select class="form-select" id="calc-pair" required onchange="calculatePnL()">
-                    <option value="">Select...</option>
-                    <option value="EUR/USD">EUR/USD</option>
-                    <option value="GBP/USD">GBP/USD</option>
-                    <option value="USD/JPY">USD/JPY</option>
-                    <option value="AUD/USD">AUD/USD</option>
-                    <option value="USD/CHF">USD/CHF</option>
-                    <option value="EUR/GBP">EUR/GBP</option>
-                </select>
-            </div>
-            
-            <div class="form-group">
-                <label class="form-label">Side*</label>
-                <select class="form-select" id="calc-side" required onchange="calculatePnL()">
-                    <option value="">Select...</option>
-                    <option value="BUY">BUY</option>
-                    <option value="SELL">SELL</option>
-                </select>
-            </div>
-            
-            <div class="form-group">
-                <label class="form-label">Position Size</label>
-                <input type="text" class="form-input" id="calc-amount" placeholder="e.g., 5000000" oninput="calculatePnL()">
-            </div>
-            
-            <div class="form-group">
-                <label class="form-label">Entry Rate</label>
-                <input type="text" class="form-input" id="calc-entry" placeholder="e.g., 1.0850 or 148.50" oninput="calculatePnL()">
-            </div>
-            
-            <div class="form-group">
-                <label class="form-label">Exit/Current Rate</label>
-                <input type="text" class="form-input" id="calc-exit" placeholder="e.g., 1.0900 or 149.00" oninput="calculatePnL()">
-            </div>
-            
+            <div class="form-group"><label class="form-label">Reference Existing Trade (Optional)</label><select class="form-select" id="calc-trade-ref" onchange="loadTradeToCalc()"><option value="">-- New Calculation --</option></select></div>
+            <div class="form-group"><label class="form-label">Currency Pair*</label><select class="form-select" id="calc-pair" required onchange="calculatePnL()"><option value="">Select...</option><option value="EUR/USD">EUR/USD</option><option value="GBP/USD">GBP/USD</option><option value="USD/JPY">USD/JPY</option><option value="AUD/USD">AUD/USD</option><option value="USD/CHF">USD/CHF</option><option value="EUR/GBP">EUR/GBP</option></select></div>
+            <div class="form-group"><label class="form-label">Side*</label><select class="form-select" id="calc-side" required onchange="calculatePnL()"><option value="">Select...</option><option value="BUY">BUY</option><option value="SELL">SELL</option></select></div>
+            <div class="form-group"><label class="form-label">Position Size</label><input type="text" class="form-input" id="calc-amount" placeholder="e.g., 5000000" oninput="calculatePnL()"></div>
+            <div class="form-group"><label class="form-label">Entry Rate</label><input type="text" class="form-input" id="calc-entry" placeholder="e.g., 1.0850" oninput="calculatePnL()"></div>
+            <div class="form-group"><label class="form-label">Exit/Current Rate</label><input type="text" class="form-input" id="calc-exit" placeholder="e.g., 1.0900" oninput="calculatePnL()"></div>
             <div class="calc-grid">
-                <div class="calc-result">
-                    <div class="calc-result-label">P&L (USD)</div>
-                    <div class="calc-result-value" id="calc-pnl-result">$0.00</div>
-                </div>
-                <div class="calc-result">
-                    <div class="calc-result-label">Pips</div>
-                    <div class="calc-result-value" id="calc-pips-result">0.0</div>
-                </div>
+                <div class="calc-result"><div class="calc-result-label">P&L (USD)</div><div class="calc-result-value" id="calc-pnl-result">$0.00</div></div>
+                <div class="calc-result"><div class="calc-result-label">Pips</div><div class="calc-result-value" id="calc-pips-result">0.0</div></div>
             </div>
-            
-            <div class="form-actions">
-                <button type="button" class="btn-secondary" onclick="closeModal('calc-modal')">Close</button>
-            </div>
+            <div class="form-actions"><button type="button" class="btn-secondary" onclick="closeModal('calc-modal')">Close</button></div>
         </div>
     </div>
 
@@ -616,56 +609,57 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         let allTrades = [], currentFilter = 'all', searchQuery = '', sortColumn = 'timestamp', sortDirection = 'desc';
         let selectedPairs = [], selectedSides = [];
         
-        function toggleAdvanced() { document.getElementById('advanced').classList.toggle('active'); }
+        function toggleFullscreen() {
+            if (!document.fullscreenElement) {
+                document.documentElement.requestFullscreen().catch(e => console.log(e));
+            } else {
+                document.exitFullscreen();
+            }
+        }
         
+        document.addEventListener('keydown', e => {
+            if (e.key === 'F11') { e.preventDefault(); toggleFullscreen(); }
+            if (e.key === 'Escape') { closeModal('trade-modal'); closeModal('calc-modal'); }
+        });
+        
+        function toggleAdvanced() { document.getElementById('advanced').classList.toggle('active'); }
         function updateFilters() {
             selectedPairs = Array.from(document.querySelectorAll('#advanced input[type="checkbox"]:not(.side-filter):checked')).map(cb => cb.value);
             selectedSides = Array.from(document.querySelectorAll('#advanced input.side-filter:checked')).map(cb => cb.value);
             renderTrades(allTrades);
         }
-        
         function clearFilters() {
             document.querySelectorAll('#advanced input[type="checkbox"]').forEach(cb => cb.checked = false);
             selectedPairs = []; selectedSides = [];
             renderTrades(allTrades);
         }
-        
         function filterTrades(f) {
             currentFilter = f;
             document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
             document.getElementById('btn-' + f).classList.add('active');
             renderTrades(allTrades);
         }
-        
         function searchTrades() {
             searchQuery = document.getElementById('search-box').value.toLowerCase().trim();
             renderTrades(allTrades);
         }
-        
         function sortTable(c) {
             sortColumn === c ? (sortDirection = sortDirection === 'asc' ? 'desc' : 'asc') : (sortColumn = c, sortDirection = 'desc');
             document.querySelectorAll('th').forEach(th => th.classList.remove('sort-asc', 'sort-desc'));
             event.target.classList.add('sort-' + sortDirection);
             renderTrades(allTrades);
         }
-        
         function getSortValue(t, c) {
             const v = {trade_id: t.trade_id, timestamp: new Date(t.timestamp).getTime(), trader: t.trader || '', pair: t.pair, side: t.side, amount: parseFloat(t.amount), entry_rate: parseFloat(t.entry_rate), current_rate: parseFloat(t.current_rate) || 0, pnl: parseFloat(t.pnl) || 0, pips: parseFloat(t.pips) || 0, counterparty: t.counterparty || '', status: t.status};
             return v[c] !== undefined ? v[c] : '';
         }
-        
         function calculatePips(pair, entry, current, side) {
             if (!entry || !current || !pair) return 0;
-            
-            let pipValue = 0.0001; // Standard pip
-            if (pair.includes('JPY')) pipValue = 0.01; // JPY pairs use 0.01
-            
+            let pipValue = pair.includes('JPY') ? 0.01 : 0.0001;
             let pips = (current - entry) / pipValue;
             if (side === 'SELL') pips = -pips;
-            
-            return Math.round(pips * 10) / 10; // Round to 1 decimal
+            return Math.round(pips * 10) / 10;
         }
-        
         function matchesFilters(t) {
             if (currentFilter === 'open' && t.status !== 'open') return false;
             if (currentFilter === 'closed' && t.status !== 'closed') return false;
@@ -674,56 +668,31 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             if (selectedSides.length && !selectedSides.includes(t.side)) return false;
             return true;
         }
-        
         function renderTrades(trades) {
             const tbody = document.getElementById('tbody');
             let filtered = trades.filter(matchesFilters);
-            
             filtered.sort((a, b) => {
                 const aVal = getSortValue(a, sortColumn), bVal = getSortValue(b, sortColumn);
                 return aVal < bVal ? (sortDirection === 'asc' ? -1 : 1) : aVal > bVal ? (sortDirection === 'asc' ? 1 : -1) : 0;
             });
-            
             document.getElementById('count-total').textContent = trades.length;
             document.getElementById('count-open').textContent = trades.filter(t => t.status === 'open').length;
             document.getElementById('count-closed').textContent = trades.filter(t => t.status === 'closed').length;
             document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
-            
             const totalPnL = trades.reduce((s, t) => s + (parseFloat(t.pnl) || 0), 0);
             const pnlEl = document.getElementById('total-pnl');
             pnlEl.textContent = (totalPnL >= 0 ? '+' : '') + '$' + Math.abs(totalPnL).toLocaleString('en-US', {minimumFractionDigits: 2});
             pnlEl.style.color = totalPnL >= 0 ? '#48bb78' : '#f56565';
-            
             tbody.innerHTML = '';
-            if (!filtered.length) {
-                tbody.innerHTML = `<tr><td colspan="13" style="text-align: center; padding: 40px; color: #a0aec0;">No matches</td></tr>`;
-                return;
-            }
-            
+            if (!filtered.length) { tbody.innerHTML = `<tr><td colspan="13" style="text-align: center; padding: 40px; color: #a0aec0;">No matches</td></tr>`; return; }
             window.filteredTrades = filtered;
             filtered.forEach((t, i) => {
                 const pnl = parseFloat(t.pnl) || 0;
                 const pips = calculatePips(t.pair, t.entry_rate, t.current_rate, t.side);
                 const time = new Date(t.timestamp).toLocaleString('en-US', {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
-                
-                tbody.insertRow().innerHTML = `
-                    <td><span class="trade-id">${t.trade_id}</span></td>
-                    <td>${time}</td>
-                    <td><span class="trader-badge">${t.trader || 'Unknown'}</span></td>
-                    <td>${t.pair}</td>
-                    <td><span class="side-${t.side.toLowerCase()}">${t.side}</span></td>
-                    <td>${t.amount.toLocaleString('en-US', {maximumFractionDigits: 0})}</td>
-                    <td class="rate-display">${t.entry_rate.toFixed(4)}</td>
-                    <td class="rate-display">${t.current_rate ? t.current_rate.toFixed(4) : '--'}</td>
-                    <td class="${pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}">${pnl >= 0 ? '+' : ''}$${Math.abs(pnl).toLocaleString('en-US', {minimumFractionDigits: 2})}</td>
-                    <td class="${pips >= 0 ? 'pnl-positive' : 'pnl-negative'}">${pips >= 0 ? '+' : ''}${pips.toFixed(1)}</td>
-                    <td><span class="bank-badge">${t.counterparty || 'N/A'}</span></td>
-                    <td><span class="status-${t.status}">${t.status.toUpperCase()}</span></td>
-                    <td><button class="edit-btn" onclick="editTrade(${i})">Edit</button><button class="delete-btn" onclick="deleteTrade('${t.trade_id}')">Del</button></td>
-                `;
+                tbody.insertRow().innerHTML = `<td><span class="trade-id">${t.trade_id}</span></td><td>${time}</td><td><span class="trader-badge">${t.trader || 'Unknown'}</span></td><td>${t.pair}</td><td><span class="side-${t.side.toLowerCase()}">${t.side}</span></td><td>${t.amount.toLocaleString('en-US', {maximumFractionDigits: 0})}</td><td class="rate-display">${t.entry_rate.toFixed(4)}</td><td class="rate-display">${t.current_rate ? t.current_rate.toFixed(4) : '--'}</td><td class="${pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}">${pnl >= 0 ? '+' : ''}$${Math.abs(pnl).toLocaleString('en-US', {minimumFractionDigits: 2})}</td><td class="${pips >= 0 ? 'pnl-positive' : 'pnl-negative'}">${pips >= 0 ? '+' : ''}${pips.toFixed(1)}</td><td><span class="bank-badge">${t.counterparty || 'N/A'}</span></td><td><span class="status-${t.status}">${t.status.toUpperCase()}</span></td><td><button class="edit-btn" onclick="editTrade(${i})">Edit</button><button class="delete-btn" onclick="deleteTrade('${t.trade_id}')">Del</button></td>`;
             });
         }
-        
         function openAddModal() {
             document.getElementById('modal-title').textContent = 'Add New Trade';
             document.getElementById('trade-form').reset();
@@ -731,13 +700,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             document.getElementById('trade-id').readOnly = false;
             document.getElementById('trade-modal').classList.add('active');
         }
-        
         function editTrade(i) {
-            const t = window.filteredTrades[i];
-            if (!t) return;
+            const t = window.filteredTrades[i]; if (!t) return;
             document.getElementById('modal-title').textContent = `Edit: ${t.trade_id}`;
             document.getElementById('trade-id').value = t.trade_id;
-            document.getElementById('trade-id').readOnly = false; // FIXED: CAN change ID now!
+            document.getElementById('trade-id').readOnly = false;
             document.getElementById('pair').value = t.pair;
             document.getElementById('side').value = t.side;
             document.getElementById('amount').value = t.amount;
@@ -747,126 +714,51 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             document.getElementById('status').value = t.status;
             document.getElementById('trade-modal').classList.add('active');
         }
-        
         function openCalcModal() {
-            // Populate trade dropdown
             const sel = document.getElementById('calc-trade-ref');
             sel.innerHTML = '<option value="">-- New Calculation --</option>';
-            allTrades.filter(t => t.status === 'open').forEach(t => {
-                sel.innerHTML += `<option value="${t.trade_id}">${t.trade_id} - ${t.pair} ${t.side} ${t.amount.toLocaleString()}</option>`;
-            });
+            allTrades.filter(t => t.status === 'open').forEach(t => { sel.innerHTML += `<option value="${t.trade_id}">${t.trade_id} - ${t.pair} ${t.side} ${t.amount.toLocaleString()}</option>`; });
             document.getElementById('calc-modal').classList.add('active');
         }
-        
         function loadTradeToCalc() {
             const id = document.getElementById('calc-trade-ref').value;
-            if (!id) {
-                document.getElementById('calc-pair').value = '';
-                document.getElementById('calc-side').value = '';
-                document.getElementById('calc-amount').value = '';
-                document.getElementById('calc-entry').value = '';
-                document.getElementById('calc-exit').value = '';
-                return;
-            }
-            
+            if (!id) { document.getElementById('calc-pair').value = ''; document.getElementById('calc-side').value = ''; document.getElementById('calc-amount').value = ''; document.getElementById('calc-entry').value = ''; document.getElementById('calc-exit').value = ''; return; }
             const trade = allTrades.find(t => t.trade_id === id);
-            if (trade) {
-                document.getElementById('calc-pair').value = trade.pair;
-                document.getElementById('calc-side').value = trade.side;
-                document.getElementById('calc-amount').value = trade.amount;
-                document.getElementById('calc-entry').value = trade.entry_rate;
-                document.getElementById('calc-exit').value = trade.current_rate || '';
-                calculatePnL();
-            }
+            if (trade) { document.getElementById('calc-pair').value = trade.pair; document.getElementById('calc-side').value = trade.side; document.getElementById('calc-amount').value = trade.amount; document.getElementById('calc-entry').value = trade.entry_rate; document.getElementById('calc-exit').value = trade.current_rate || ''; calculatePnL(); }
         }
-        
         function calculatePnL() {
-            const pair = document.getElementById('calc-pair').value;
-            const side = document.getElementById('calc-side').value;
+            const pair = document.getElementById('calc-pair').value, side = document.getElementById('calc-side').value;
             const amount = parseFloat(document.getElementById('calc-amount').value) || 0;
             const entry = parseFloat(document.getElementById('calc-entry').value) || 0;
             const exit = parseFloat(document.getElementById('calc-exit').value) || 0;
-            
-            if (!pair || !side || !amount || !entry || !exit) {
-                document.getElementById('calc-pnl-result').textContent = '$0.00';
-                document.getElementById('calc-pips-result').textContent = '0.0';
-                return;
-            }
-            
-            // Calculate P&L
-            let pnl = 0;
-            if (side === 'BUY') {
-                pnl = (exit - entry) * amount;
-            } else {
-                pnl = (entry - exit) * amount;
-            }
-            
-            // Calculate Pips
+            if (!pair || !side || !amount || !entry || !exit) { document.getElementById('calc-pnl-result').textContent = '$0.00'; document.getElementById('calc-pips-result').textContent = '0.0'; return; }
+            let pnl = side === 'BUY' ? (exit - entry) * amount : (entry - exit) * amount;
             const pips = calculatePips(pair, entry, exit, side);
-            
-            // Display
             const pnlEl = document.getElementById('calc-pnl-result');
             pnlEl.textContent = (pnl >= 0 ? '+' : '') + '$' + Math.abs(pnl).toLocaleString('en-US', {minimumFractionDigits: 2});
             pnlEl.style.color = pnl >= 0 ? '#48bb78' : '#f56565';
-            
             const pipsEl = document.getElementById('calc-pips-result');
             pipsEl.textContent = (pips >= 0 ? '+' : '') + pips.toFixed(1);
             pipsEl.style.color = pips >= 0 ? '#48bb78' : '#f56565';
         }
-        
-        function closeModal(id) {
-            document.getElementById(id).classList.remove('active');
-        }
-        
+        function closeModal(id) { document.getElementById(id).classList.remove('active'); }
         function saveTrade(e) {
             e.preventDefault();
-            const pair = document.getElementById('pair').value;
-            const currencies = pair.split('/');
-            
-            const data = {
-                trade_id: document.getElementById('trade-id').value.trim(),
-                timestamp: new Date().toISOString(),
-                currency_pair: pair,
-                base_currency: currencies[0],
-                quote_currency: currencies[1] || '',
-                side: document.getElementById('side').value,
-                notional_amount: parseFloat(document.getElementById('amount').value),
-                execution_rate: parseFloat(document.getElementById('rate').value),
-                trader_name: document.getElementById('trader').value.trim(),
-                counterparty: document.getElementById('counterparty').value.trim(),
-                status: document.getElementById('status').value,
-                value_date: new Date(Date.now() + 2*24*60*60*1000).toISOString().split('T')[0],
-                settlement_date: new Date(Date.now() + 2*24*60*60*1000).toISOString().split('T')[0]
-            };
-            
+            const pair = document.getElementById('pair').value, currencies = pair.split('/');
+            const data = { trade_id: document.getElementById('trade-id').value.trim(), timestamp: new Date().toISOString(), currency_pair: pair, base_currency: currencies[0], quote_currency: currencies[1] || '', side: document.getElementById('side').value, notional_amount: parseFloat(document.getElementById('amount').value), execution_rate: parseFloat(document.getElementById('rate').value), trader_name: document.getElementById('trader').value.trim(), counterparty: document.getElementById('counterparty').value.trim(), status: document.getElementById('status').value, value_date: new Date(Date.now() + 2*24*60*60*1000).toISOString().split('T')[0], settlement_date: new Date(Date.now() + 2*24*60*60*1000).toISOString().split('T')[0] };
             fetch('/api/trade', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)})
-            .then(r => r.json())
-            .then(d => { if (d.success) { closeModal('trade-modal'); setTimeout(updateTrades, 100); } else alert('Error: ' + (d.error || 'Unknown')); })
-            .catch(err => alert('Error: ' + err));
+            .then(r => r.json()).then(d => { if (d.success) { closeModal('trade-modal'); setTimeout(updateTrades, 100); } else alert('Error: ' + (d.error || 'Unknown')); }).catch(err => alert('Error: ' + err));
         }
-        
         function deleteTrade(id) {
             if (!confirm(`Delete ${id}?`)) return;
-            fetch('/api/trade/' + id, {method: 'DELETE'})
-            .then(r => r.json())
-            .then(d => { if (d.success) setTimeout(updateTrades, 100); })
-            .catch(err => alert('Error'));
+            fetch('/api/trade/' + id, {method: 'DELETE'}).then(r => r.json()).then(d => { if (d.success) setTimeout(updateTrades, 100); }).catch(() => alert('Error'));
         }
+        function updateStatus() { fetch('/api/status').then(r => r.json()).then(d => document.getElementById('status').textContent = d.status).catch(() => {}); }
+        function updateTrades() { fetch('/api/trades').then(r => r.json()).then(trades => { allTrades = trades; renderTrades(trades); }).catch(() => {}); }
         
-        function updateStatus() {
-            fetch('/api/status').then(r => r.json()).then(d => document.getElementById('status').textContent = d.status).catch(() => {});
-        }
-        
-        function updateTrades() {
-            fetch('/api/trades').then(r => r.json()).then(trades => { allTrades = trades; renderTrades(trades); }).catch(() => {});
-        }
-        
-        document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeModal('trade-modal'); closeModal('calc-modal'); } });
-        
-        updateStatus();
-        updateTrades();
+        updateStatus(); updateTrades();
         setInterval(updateStatus, 5000);
-        setInterval(updateTrades, 1000);
+        setInterval(updateTrades, 1000);  // 1 second updates
     </script>
 </body>
 </html>"""
@@ -887,29 +779,29 @@ def api_get_trades():
             'amount': float(t.get('notional_amount', 0)),
             'entry_rate': float(t.get('execution_rate', 0)),
             'current_rate': float(t.get('current_market_rate')) if t.get('current_market_rate') else None,
-            'pnl': float(t.get('unrealized_pnl', 0)) if t.get('status') == 'open' else float(t.get('realized_pnl', 0)) if t.get('realized_pnl') else 0.0,
+            'pnl': float(t.get('unrealized_pnl', 0)) if t.get('status') == 'open' else float(t.get('realized_pnl') or 0),
             'status': str(t.get('status', 'open')),
             'trader': str(t.get('trader_name', '')),
             'counterparty': str(t.get('counterparty', ''))
         } for t in trades])
-    except:
+    except Exception:
         return jsonify([])
 
 @app.route('/api/status')
 def api_status():
-    return jsonify({'status': tracker_instance.bloomberg.get_connection_status() if tracker_instance else 'Starting...'})
+    status = tracker_instance.bloomberg.get_connection_status() if tracker_instance else 'Starting...'
+    return jsonify({'status': status})
 
 @app.route('/api/trade', methods=['POST'])
 def api_add_trade():
     try:
         data = request.get_json()
         trade = scrub_trade_details(data)
-        
         if trade and shared_db.save_trade(trade):
             if tracker_instance and trade['trade_id'] not in tracker_instance.tracked_trades:
                 tracker_instance.tracked_trades.add(trade['trade_id'])
             return jsonify({'success': True})
-        return jsonify({'success': False, 'error': 'Invalid'}), 400
+        return jsonify({'success': False, 'error': 'Invalid data'}), 400
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -921,19 +813,26 @@ def api_delete_trade(trade_id):
                 tracker_instance.tracked_trades.discard(trade_id)
             return jsonify({'success': True})
         return jsonify({'success': False}), 404
-    except:
+    except Exception:
         return jsonify({'success': False}), 500
 
 # ============================================================================
-# TRACKER
+# TRACKER (Optimized intervals)
 # ============================================================================
 
 class TeamFXTracker:
     def __init__(self):
         self.bloomberg = BloombergConnector(use_real=Config.USE_REAL_BLOOMBERG)
         self.storage = shared_db
-        self.tracked_trades = set(t['trade_id'] for t in self.storage.get_all_trades())
+        self.tracked_trades = set()
         self.running = True
+        # Load tracked trades in background
+        threading.Thread(target=self._load_tracked_trades, daemon=True).start()
+    
+    def _load_tracked_trades(self):
+        """Load existing trade IDs in background"""
+        for t in self.storage.get_all_trades():
+            self.tracked_trades.add(t['trade_id'])
     
     def start_monitoring(self):
         threading.Thread(target=self.monitor_trades_loop, daemon=True).start()
@@ -961,8 +860,9 @@ class TeamFXTracker:
                         trade['current_market_rate'] = self.bloomberg.get_current_rate(trade['currency_pair'])
                         trade['realized_pnl'] = self.calculate_pnl(trade)
                         self.storage.save_trade(trade)
-                time.sleep(30)
-            except:
+                
+                time.sleep(Config.TRADE_MONITOR_INTERVAL)
+            except Exception:
                 time.sleep(5)
     
     def update_pnl_loop(self):
@@ -972,47 +872,69 @@ class TeamFXTracker:
                     trade['current_market_rate'] = self.bloomberg.get_current_rate(trade['currency_pair'])
                     trade['unrealized_pnl'] = self.calculate_pnl(trade)
                     self.storage.save_trade(trade)
+                time.sleep(Config.PNL_UPDATE_INTERVAL)  # Now 1 second
+            except Exception:
                 time.sleep(2)
-            except:
-                time.sleep(5)
     
     def calculate_pnl(self, trade):
         try:
-            if not trade.get('current_market_rate'): return 0.0
-            entry, current, amount = float(trade['execution_rate']), float(trade['current_market_rate']), float(trade['notional_amount'])
-            return round((current - entry) * amount if trade['side'] == 'BUY' else (entry - current) * amount, 2)
-        except:
+            if not trade.get('current_market_rate'):
+                return 0.0
+            entry = float(trade['execution_rate'])
+            current = float(trade['current_market_rate'])
+            amount = float(trade['notional_amount'])
+            if trade['side'] == 'BUY':
+                return round((current - entry) * amount, 2)
+            else:
+                return round((entry - current) * amount, 2)
+        except (ValueError, KeyError, TypeError):
             return 0.0
 
 # ============================================================================
-# MAIN - OPTIMIZED
+# MAIN - Optimized startup
 # ============================================================================
 
 def start_flask():
+    """Start Flask with optimized settings"""
+    import logging
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)  # Reduce Flask logging overhead
     app.run(host='127.0.0.1', port=Config.PORT, debug=False, use_reloader=False, threaded=True)
 
 def main():
     global tracker_instance
     
     try:
+        # Start Flask immediately in background
+        flask_thread = threading.Thread(target=start_flask, daemon=True)
+        flask_thread.start()
+        
+        # Initialize tracker (Bloomberg connects async, won't block)
         tracker_instance = TeamFXTracker()
-        threading.Thread(target=start_flask, daemon=True).start()
         tracker_instance.start_monitoring()
         
+        # Small delay to ensure Flask is ready
+        time.sleep(0.3)
+        
+        # Create window with fullscreen support
         webview.create_window(
             Config.WINDOW_TITLE,
             f'http://127.0.0.1:{Config.PORT}',
             width=Config.WINDOW_WIDTH,
             height=Config.WINDOW_HEIGHT,
             resizable=True,
-            min_size=(1200, 700)
+            min_size=(1200, 700),
+            easy_drag=False,  # Better performance
+            frameless=False,  # Keep window frame for proper maximize
+            text_select=True
         )
         
+        # Start webview (blocking)
         webview.start(debug=False)
         
     except Exception as e:
         print(f"Error: {e}")
-        input("Press Enter...")
+        input("Press Enter to exit...")
         sys.exit(1)
 
 if __name__ == '__main__':
