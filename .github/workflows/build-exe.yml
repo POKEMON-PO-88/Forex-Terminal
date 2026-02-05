@@ -27,9 +27,9 @@ jobs:
       working-directory: FXTracker
       run: |
         if (Test-Path fx_icon.ico) {
-          pyinstaller --onefile --windowed --name "FX Trade Tracker" --icon=fx_icon.ico --hidden-import=flask --hidden-import=sqlite3 --hidden-import=webview --noconfirm fx_tracker_windows.py
+          pyinstaller --onefile --windowed --name "FX Trade Tracker" --icon=fx_icon.ico --hidden-import=flask --hidden-import=sqlite3 --noconfirm fx_tracker_windows.py
         } else {
-          pyinstaller --onefile --windowed --name "FX Trade Tracker" --hidden-import=flask --hidden-import=sqlite3 --hidden-import=webview --noconfirm fx_tracker_windows.py
+          pyinstaller --onefile --windowed --name "FX Trade Tracker" --hidden-import=flask --hidden-import=sqlite3 --noconfirm fx_tracker_windows.py
         }
       shell: powershell
       
