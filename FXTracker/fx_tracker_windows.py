@@ -622,13 +622,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         let allTrades = [], currentFilter = 'all', searchQuery = '', sortColumn = 'timestamp', sortDirection = 'desc';
         let selectedPairs = [], selectedSides = [];
         
-        // FIX 2: Fullscreen function
+        // FIX 2: Fullscreen function - calls Flask endpoint (no slow js_api bridge)
         function toggleFullscreen() {
-            if (!document.fullscreenElement) {
-                document.documentElement.requestFullscreen();
-            } else {
-                document.exitFullscreen();
-            }
+            fetch('/api/fullscreen', {method: 'POST'});
         }
         
         function toggleAdvanced() { document.getElementById('advanced').classList.toggle('active'); }
@@ -966,6 +962,13 @@ def api_delete_trade(trade_id):
     except:
         return jsonify({'success': False}), 500
 
+@app.route('/api/fullscreen', methods=['POST'])
+def api_fullscreen():
+    global webview_window
+    if webview_window:
+        webview_window.toggle_fullscreen()
+    return jsonify({'success': True})
+
 # ============================================================================
 # TRACKER
 # ============================================================================
@@ -1027,21 +1030,23 @@ class TeamFXTracker:
             return 0.0
 
 # ============================================================================
-# MAIN - OPTIMIZED
+# MAIN
 # ============================================================================
+
+webview_window = None
 
 def start_flask():
     app.run(host='127.0.0.1', port=Config.PORT, debug=False, use_reloader=False, threaded=True)
 
 def main():
-    global tracker_instance
+    global tracker_instance, webview_window
     
     try:
         tracker_instance = TeamFXTracker()
         threading.Thread(target=start_flask, daemon=True).start()
         tracker_instance.start_monitoring()
         
-        webview.create_window(
+        webview_window = webview.create_window(
             Config.WINDOW_TITLE,
             f'http://127.0.0.1:{Config.PORT}',
             width=Config.WINDOW_WIDTH,
