@@ -1,0 +1,141 @@
+# .github/workflows/build-exe.yml
+# ============================================================================
+# FX TRACKER - GitHub Actions Build (Demo Mode)
+# ============================================================================
+# NOTE: This builds WITHOUT Bloomberg API (GitHub doesn't have Bloomberg)
+# For Bloomberg-enabled builds, use build.bat on a PC with Bloomberg Terminal
+# ============================================================================
+
+name: Build FX Tracker EXE
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:  # Manual trigger button
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller flask pywebview
+
+      - name: Find source file
+        id: find-source
+        shell: pwsh
+        run: |
+          $sourceFile = $null
+          $searchPaths = @(
+            "FXTracker/fx_tracker_windows_optimized.py",
+            "FXTracker/fx_tracker_windows_app.py",
+            "FXTracker/fx_tracker_team.py",
+            "fx_tracker_windows_optimized.py",
+            "fx_tracker_windows_app.py",
+            "fx_tracker_team.py"
+          )
+          foreach ($path in $searchPaths) {
+            if (Test-Path $path) {
+              $sourceFile = $path
+              break
+            }
+          }
+          if (-not $sourceFile) {
+            Write-Error "No source file found!"
+            exit 1
+          }
+          Write-Host "Found source: $sourceFile"
+          echo "SOURCE_FILE=$sourceFile" >> $env:GITHUB_OUTPUT
+          
+          # Determine working directory
+          $workDir = Split-Path $sourceFile -Parent
+          if (-not $workDir) { $workDir = "." }
+          echo "WORK_DIR=$workDir" >> $env:GITHUB_OUTPUT
+
+      - name: Build EXE
+        shell: pwsh
+        run: |
+          $sourceFile = "${{ steps.find-source.outputs.SOURCE_FILE }}"
+          $fileName = Split-Path $sourceFile -Leaf
+          
+          # Check for icon
+          $iconParam = ""
+          $iconPath = Join-Path (Split-Path $sourceFile -Parent) "fx_icon.ico"
+          if (Test-Path $iconPath) {
+            $iconParam = "--icon=$iconPath"
+            Write-Host "Using icon: $iconPath"
+          }
+          
+          # Build command
+          $buildArgs = @(
+            "--onefile",
+            "--noconsole",
+            '--name=FX Trade Tracker',
+            "--hidden-import=flask",
+            "--hidden-import=flask.json",
+            "--hidden-import=jinja2",
+            "--hidden-import=werkzeug",
+            "--hidden-import=sqlite3",
+            "--hidden-import=webview",
+            "--exclude-module=tkinter",
+            "--exclude-module=matplotlib",
+            "--exclude-module=numpy",
+            "--exclude-module=pandas",
+            "--exclude-module=PIL",
+            "--exclude-module=pytest",
+            "--exclude-module=setuptools",
+            "--noconfirm",
+            $sourceFile
+          )
+          
+          if ($iconParam) { $buildArgs += $iconParam }
+          
+          Write-Host "Building: pyinstaller $($buildArgs -join ' ')"
+          & pyinstaller @buildArgs
+
+      - name: Verify build
+        shell: pwsh
+        run: |
+          $exePath = "dist/FX Trade Tracker.exe"
+          if (-not (Test-Path $exePath)) {
+            Write-Error "Build failed - exe not found"
+            exit 1
+          }
+          $size = (Get-Item $exePath).Length / 1MB
+          Write-Host "Build successful! Size: $([math]::Round($size, 2)) MB"
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: FX-Trade-Tracker-Windows-DemoMode
+          path: dist/*.exe
+          retention-days: 30
+
+      # Create release on version tags
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/*.exe
+          body: |
+            ## FX Trade Tracker
+            
+            **Note:** This build uses Demo Mode (simulated data).
+            
+            For Bloomberg integration, build locally using `build.bat` on a machine with Bloomberg Terminal installed.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
