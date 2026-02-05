@@ -15,7 +15,6 @@ import threading
 import time
 import random
 import sqlite3
-import uuid
 from datetime import datetime, timedelta
 
 # ============================================================================
@@ -121,11 +120,8 @@ class BloombergConnector:
 class MockBloombergAPI:
     def __init__(self):
         self.trades = []
+        self.trade_counter = 1 
         self._generate_initial_team_trades()
-    
-    def _generate_trade_id(self):
-        """Generate unique trade ID using timestamp + random number"""
-        return f'FX{datetime.now().strftime("%Y%m%d")}{uuid.uuid4().hex[:6].upper()}'
     
     def get_realistic_rate(self, pair):
         """Get realistic rate range for each currency pair"""
@@ -153,7 +149,7 @@ class MockBloombergAPI:
             currencies = pair.split('/')
             
             trade = {
-                'trade_id': self._generate_trade_id(),
+                'trade_id': f'FX{datetime.now().strftime("%Y%m%d%H%M%S")}{self.trade_counter:06d}',
                 'timestamp': datetime.now() - timedelta(hours=random.randint(1, 72)),
                 'currency_pair': pair,
                 'side': random.choice(['BUY', 'SELL']),
@@ -168,7 +164,8 @@ class MockBloombergAPI:
                 'status': random.choice(['open', 'open', 'open', 'open', 'closed', 'closed', 'closed'])
             }
             self.trades.append(trade)
-    
+            self.trade_counter += 1
+            
     def get_trades(self):
         return self.trades
     
@@ -202,7 +199,7 @@ class MockBloombergAPI:
             currencies = pair.split('/')
             
             trade = {
-                'trade_id': self._generate_trade_id(),
+                'trade_id': f'FX{datetime.now().strftime("%Y%m%d%H%M%S")}{self.trade_counter:06d}',
                 'timestamp': datetime.now(),
                 'currency_pair': pair,
                 'side': random.choice(['BUY', 'SELL']),
@@ -217,6 +214,7 @@ class MockBloombergAPI:
                 'status': 'open'
             }
             self.trades.append(trade)
+            self.trade_counter += 1
             return trade
         return None
     
