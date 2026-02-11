@@ -1,11 +1,4 @@
-# fx_tracker_windows.py - YOUR ORIGINAL CODE WITH 4 MINIMAL FIXES
-# ONLY CHANGES:
-# 1. Line 377: time.sleep(2) → time.sleep(1)
-# 2. Line 571 in JS: setInterval 2000 → 1000  
-# 3. Added fullscreen button + function
-# 4. Fixed pips sorting in getSortValue
-# 5. Reset calculator fields in openCalcModal
-
+#import
 import sys
 import os
 import subprocess
@@ -14,40 +7,17 @@ import time
 import random
 import sqlite3
 from datetime import datetime, timedelta
-
-# ============================================================================
-# AUTO-INSTALL PACKAGES
-# ============================================================================
-
-def install_packages():
-    packages = {'flask': 'flask', 'webview': 'pywebview'}
-    for module, package in packages.items():
-        try:
-            __import__(module)
-        except ImportError:
-            subprocess.check_call([sys.executable, '-m', 'pip', 'install', package, '--quiet'],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-try:
-    install_packages()
-    from flask import Flask, render_template_string, jsonify, request
-    import webview
-except ImportError:
-    print("Error: Run: pip install flask pywebview")
-    input("Press Enter...")
-    sys.exit(1)
-
-# Try to import Bloomberg API (will bundle if installed)
+from flask import Flask, render_template_string, jsonify, request
+import webview
+#bloomberg api check
 try:
     import blpapi
     HAS_BLOOMBERG = True
 except ImportError:
     HAS_BLOOMBERG = False
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
 
+#config
 class Config:
     SHARED_FOLDER = r"Z:\TradingDesk\FXTracker"
     # SHARED_FOLDER = os.path.join(os.path.expanduser('~'), 'Desktop', 'FXTracker_Test')
@@ -60,17 +30,17 @@ class Config:
         os.makedirs(SHARED_FOLDER, exist_ok=True)
         DATABASE_FILE = os.path.join(SHARED_FOLDER, 'team_fx_trades.db')
     
+    
     USE_REAL_BLOOMBERG = HAS_BLOOMBERG
     PORT = 8765
-    
+
+    #window
     WINDOW_TITLE = "FX Trade Tracker"
     WINDOW_WIDTH = 1600
     WINDOW_HEIGHT = 950
 
-# ============================================================================
-# BLOOMBERG CONNECTOR
-# ============================================================================
 
+#connecting using blpapi
 class BloombergConnector:
     def __init__(self, use_real=True):
         self.use_real = use_real and HAS_BLOOMBERG
@@ -86,15 +56,15 @@ class BloombergConnector:
             self.connection_status = "Connecting..."
             session_options = blpapi.SessionOptions()
             session_options.setServerHost('localhost')
-            session_options.setServerPort(8194)
+            session_options.setServerPort(PORT)
             self.session = blpapi.Session(session_options)
             
             if self.session.start() and self.session.openService("//blp/emapisvc"):
-                self.connection_status = "✅ Bloomberg Connected"
+                self.connection_status = "Bloomberg Connected"
             else:
                 raise Exception()
         except:
-            self.connection_status = "⚠️ Demo mode"
+            self.connection_status = "Demo mode"
             self.use_real = False
     
     def get_connection_status(self):
@@ -111,10 +81,8 @@ class BloombergConnector:
             return self.mock_api.maybe_generate_new_trade(), self.mock_api.maybe_close_trade()
         return None, None
 
-# ============================================================================
-# MOCK DATA - FIXED REALISTIC RATES PER CURRENCY PAIR
-# ============================================================================
 
+#mock data generation when blpapi and bloomberg not found
 class MockBloombergAPI:
     def __init__(self):
         self.trades = []
@@ -126,7 +94,7 @@ class MockBloombergAPI:
         rate_ranges = {
             'EUR/USD': (1.05, 1.12),      # Euro typically 1.05-1.12
             'GBP/USD': (1.20, 1.32),      # Pound typically 1.20-1.32
-            'USD/JPY': (140.0, 155.0),    # Yen typically 140-155 (HIGH NUMBER!)
+            'USD/JPY': (140.0, 155.0),    # Yen typically 140-155 
             'AUD/USD': (0.62, 0.70),      # Aussie typically 0.62-0.70
             'USD/CHF': (0.82, 0.90),      # Swiss typically 0.82-0.90
             'EUR/GBP': (0.83, 0.88),      # Euro/Pound typically 0.83-0.88
@@ -154,7 +122,7 @@ class MockBloombergAPI:
                 'notional_amount': random.randint(500000, 25000000),
                 'base_currency': currencies[0],
                 'quote_currency': currencies[1],
-                'execution_rate': self.get_realistic_rate(pair),  # FIXED: Now realistic!
+                'execution_rate': self.get_realistic_rate(pair),  
                 'value_date': (datetime.now() + timedelta(days=2)).date(),
                 'settlement_date': (datetime.now() + timedelta(days=2)).date(),
                 'counterparty': random.choice(counterparties),
@@ -171,7 +139,7 @@ class MockBloombergAPI:
         base_rates = {
             'EUR/USD': 1.0850,
             'GBP/USD': 1.2650,
-            'USD/JPY': 148.50,  # FIXED: Realistic JPY rate!
+            'USD/JPY': 148.50, 
             'AUD/USD': 0.6550,
             'USD/CHF': 0.8450,
             'EUR/GBP': 0.8580,
@@ -180,9 +148,9 @@ class MockBloombergAPI:
         }
         base = base_rates.get(pair, 1.0)
         
-        # Add small variation
+        # to simulate diffrent volatilities
         if 'JPY' in pair:
-            variation = random.uniform(-2.0, 2.0)  # JPY moves in larger numbers
+            variation = random.uniform(-2.0, 2.0) 
         else:
             variation = random.uniform(-0.02, 0.02)
         
@@ -223,9 +191,7 @@ class MockBloombergAPI:
             return trade
         return None
 
-# ============================================================================
-# DATABASE
-# ============================================================================
+#scrubbing (making data cleaner) fake and real trades to send to sqlite database
 
 def scrub_trade_details(trade_raw):
     if not trade_raw: return None
@@ -343,9 +309,7 @@ class SharedDatabase:
 
 shared_db = SharedDatabase(Config.DATABASE_FILE)
 
-# ============================================================================
-# FLASK APP
-# ============================================================================
+#html and flask integration to take from database and update application in real time 
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'fx-tracker'
@@ -969,9 +933,7 @@ def api_fullscreen():
         webview_window.toggle_fullscreen()
     return jsonify({'success': True})
 
-# ============================================================================
-# TRACKER
-# ============================================================================
+#tracker main 
 
 class TeamFXTracker:
     def __init__(self):
@@ -1029,9 +991,7 @@ class TeamFXTracker:
         except:
             return 0.0
 
-# ============================================================================
-# MAIN
-# ============================================================================
+#main to run evreything
 
 webview_window = None
 
