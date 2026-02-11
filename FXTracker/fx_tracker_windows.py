@@ -1,4 +1,5 @@
-#import
+#imports
+
 import sys
 import os
 import subprocess
@@ -9,15 +10,15 @@ import sqlite3
 from datetime import datetime, timedelta
 from flask import Flask, render_template_string, jsonify, request
 import webview
-#bloomberg api check
+
 try:
     import blpapi
     HAS_BLOOMBERG = True
 except ImportError:
     HAS_BLOOMBERG = False
 
-
 #config
+
 class Config:
     SHARED_FOLDER = r"Z:\TradingDesk\FXTracker"
     # SHARED_FOLDER = os.path.join(os.path.expanduser('~'), 'Desktop', 'FXTracker_Test')
@@ -30,17 +31,16 @@ class Config:
         os.makedirs(SHARED_FOLDER, exist_ok=True)
         DATABASE_FILE = os.path.join(SHARED_FOLDER, 'team_fx_trades.db')
     
-    
     USE_REAL_BLOOMBERG = HAS_BLOOMBERG
     PORT = 8765
 
-    #window
+    #windows
     WINDOW_TITLE = "FX Trade Tracker"
     WINDOW_WIDTH = 1600
     WINDOW_HEIGHT = 950
 
+#blpapi to connect to bloomberg server
 
-#connecting using blpapi
 class BloombergConnector:
     def __init__(self, use_real=True):
         self.use_real = use_real and HAS_BLOOMBERG
@@ -56,7 +56,7 @@ class BloombergConnector:
             self.connection_status = "Connecting..."
             session_options = blpapi.SessionOptions()
             session_options.setServerHost('localhost')
-            session_options.setServerPort(PORT)
+            session_options.setServerPort(8194)
             self.session = blpapi.Session(session_options)
             
             if self.session.start() and self.session.openService("//blp/emapisvc"):
@@ -81,8 +81,8 @@ class BloombergConnector:
             return self.mock_api.maybe_generate_new_trade(), self.mock_api.maybe_close_trade()
         return None, None
 
+#mockdata generator
 
-#mock data generation when blpapi and bloomberg not found
 class MockBloombergAPI:
     def __init__(self):
         self.trades = []
@@ -122,7 +122,7 @@ class MockBloombergAPI:
                 'notional_amount': random.randint(500000, 25000000),
                 'base_currency': currencies[0],
                 'quote_currency': currencies[1],
-                'execution_rate': self.get_realistic_rate(pair),  
+                'execution_rate': self.get_realistic_rate(pair),  # FIXED: Now realistic!
                 'value_date': (datetime.now() + timedelta(days=2)).date(),
                 'settlement_date': (datetime.now() + timedelta(days=2)).date(),
                 'counterparty': random.choice(counterparties),
@@ -139,7 +139,7 @@ class MockBloombergAPI:
         base_rates = {
             'EUR/USD': 1.0850,
             'GBP/USD': 1.2650,
-            'USD/JPY': 148.50, 
+            'USD/JPY': 148.50,  # FIXED: Realistic JPY rate!
             'AUD/USD': 0.6550,
             'USD/CHF': 0.8450,
             'EUR/GBP': 0.8580,
@@ -148,7 +148,7 @@ class MockBloombergAPI:
         }
         base = base_rates.get(pair, 1.0)
         
-        # to simulate diffrent volatilities
+        # to change volatility for diffrent currency
         if 'JPY' in pair:
             variation = random.uniform(-2.0, 2.0) 
         else:
@@ -191,7 +191,7 @@ class MockBloombergAPI:
             return trade
         return None
 
-#scrubbing (making data cleaner) fake and real trades to send to sqlite database
+#scrubbing to make data nice for database
 
 def scrub_trade_details(trade_raw):
     if not trade_raw: return None
@@ -309,7 +309,7 @@ class SharedDatabase:
 
 shared_db = SharedDatabase(Config.DATABASE_FILE)
 
-#html and flask integration to take from database and update application in real time 
+#flask with html
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'fx-tracker'
@@ -334,7 +334,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .filter-btn:not(.active) { background: #edf2f7; color: #4a5568; }
         .action-btn { background: #48bb78; color: white; }
         .action-btn.calc { background: #ed8936; }
-        .action-btn.fullscreen { background: #4299e1; }
         .filter-btn:hover, .action-btn:hover { transform: translateY(-1px); }
         .search-box { padding: 7px 12px; border: 2px solid #e2e8f0; border-radius: 6px; font-size: 12px; width: 250px; }
         .search-box:focus { outline: none; border-color: #667eea; }
@@ -404,7 +403,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <button class="toggle-advanced" onclick="toggleAdvanced()">⚙️ Filters</button>
             <button class="action-btn" onclick="openAddModal()">➕ Add</button>
             <button class="action-btn calc" onclick="openCalcModal()">📊 P&L Calculator</button>
-            <button class="action-btn fullscreen" onclick="toggleFullscreen()">⛶ Fullscreen</button>
         </div>
         
         <div class="advanced-search" id="advanced">
@@ -586,11 +584,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         let allTrades = [], currentFilter = 'all', searchQuery = '', sortColumn = 'timestamp', sortDirection = 'desc';
         let selectedPairs = [], selectedSides = [];
         
-        // FIX 2: Fullscreen function - calls Flask endpoint (no slow js_api bridge)
-        function toggleFullscreen() {
-            fetch('/api/fullscreen', {method: 'POST'});
-        }
-        
         function toggleAdvanced() { document.getElementById('advanced').classList.toggle('active'); }
         
         function updateFilters() {
@@ -624,6 +617,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             renderTrades(allTrades);
         }
         
+        function getSortValue(t, c) {
+            const v = {trade_id: t.trade_id, timestamp: new Date(t.timestamp).getTime(), trader: t.trader || '', pair: t.pair, side: t.side, amount: parseFloat(t.amount), entry_rate: parseFloat(t.entry_rate), current_rate: parseFloat(t.current_rate) || 0, pnl: parseFloat(t.pnl) || 0, pips: parseFloat(t.pips) || 0, counterparty: t.counterparty || '', status: t.status};
+            return v[c] !== undefined ? v[c] : '';
+        }
+        
         function calculatePips(pair, entry, current, side) {
             if (!entry || !current || !pair) return 0;
             
@@ -634,15 +632,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             if (side === 'SELL') pips = -pips;
             
             return Math.round(pips * 10) / 10; // Round to 1 decimal
-        }
-        
-        // FIX 3: Pips sorting - calculate on the fly instead of using t.pips (which doesn't exist)
-        function getSortValue(t, c) {
-            if (c === 'pips') {
-                return calculatePips(t.pair, t.entry_rate, t.current_rate, t.side);
-            }
-            const v = {trade_id: t.trade_id, timestamp: new Date(t.timestamp).getTime(), trader: t.trader || '', pair: t.pair, side: t.side, amount: parseFloat(t.amount), entry_rate: parseFloat(t.entry_rate), current_rate: parseFloat(t.current_rate) || 0, pnl: parseFloat(t.pnl) || 0, counterparty: t.counterparty || '', status: t.status};
-            return v[c] !== undefined ? v[c] : '';
         }
         
         function matchesFilters(t) {
@@ -716,7 +705,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             if (!t) return;
             document.getElementById('modal-title').textContent = `Edit: ${t.trade_id}`;
             document.getElementById('trade-id').value = t.trade_id;
-            document.getElementById('trade-id').readOnly = false;
+            document.getElementById('trade-id').readOnly = false; // FIXED: CAN change ID now!
             document.getElementById('pair').value = t.pair;
             document.getElementById('side').value = t.side;
             document.getElementById('amount').value = t.amount;
@@ -727,20 +716,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             document.getElementById('trade-modal').classList.add('active');
         }
         
-        // FIX 4: Reset calculator fields when OPENING (not closing)
         function openCalcModal() {
-            // Reset all fields first
-            document.getElementById('calc-trade-ref').value = '';
-            document.getElementById('calc-pair').value = '';
-            document.getElementById('calc-side').value = '';
-            document.getElementById('calc-amount').value = '';
-            document.getElementById('calc-entry').value = '';
-            document.getElementById('calc-exit').value = '';
-            document.getElementById('calc-pnl-result').textContent = '$0.00';
-            document.getElementById('calc-pnl-result').style.color = '#2d3748';
-            document.getElementById('calc-pips-result').textContent = '0.0';
-            document.getElementById('calc-pips-result').style.color = '#2d3748';
-            
             // Populate trade dropdown
             const sel = document.getElementById('calc-trade-ref');
             sel.innerHTML = '<option value="">-- New Calculation --</option>';
@@ -758,7 +734,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 document.getElementById('calc-amount').value = '';
                 document.getElementById('calc-entry').value = '';
                 document.getElementById('calc-exit').value = '';
-                calculatePnL();
                 return;
             }
             
@@ -854,21 +829,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             fetch('/api/trades').then(r => r.json()).then(trades => { allTrades = trades; renderTrades(trades); }).catch(() => {});
         }
         
-        document.addEventListener('keydown', e => { 
-            if (e.key === 'Escape') { 
-                closeModal('trade-modal'); 
-                closeModal('calc-modal'); 
-            }
-            if (e.key === 'F11') {
-                e.preventDefault();
-                toggleFullscreen();
-            }
-        });
+        document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeModal('trade-modal'); closeModal('calc-modal'); } });
         
         updateStatus();
         updateTrades();
         setInterval(updateStatus, 5000);
-        setInterval(updateTrades, 1000);  // FIX 1: Changed from 2000 to 1000
+        setInterval(updateTrades, 1000);
     </script>
 </body>
 </html>"""
@@ -926,14 +892,7 @@ def api_delete_trade(trade_id):
     except:
         return jsonify({'success': False}), 500
 
-@app.route('/api/fullscreen', methods=['POST'])
-def api_fullscreen():
-    global webview_window
-    if webview_window:
-        webview_window.toggle_fullscreen()
-    return jsonify({'success': True})
-
-#tracker main 
+#main tracker
 
 class TeamFXTracker:
     def __init__(self):
@@ -979,7 +938,7 @@ class TeamFXTracker:
                     trade['current_market_rate'] = self.bloomberg.get_current_rate(trade['currency_pair'])
                     trade['unrealized_pnl'] = self.calculate_pnl(trade)
                     self.storage.save_trade(trade)
-                time.sleep(1)  # FIX 1: Changed from 2 to 1
+                time.sleep(2)
             except:
                 time.sleep(5)
     
@@ -991,22 +950,20 @@ class TeamFXTracker:
         except:
             return 0.0
 
-#main to run evreything
-
-webview_window = None
+#main
 
 def start_flask():
     app.run(host='127.0.0.1', port=Config.PORT, debug=False, use_reloader=False, threaded=True)
 
 def main():
-    global tracker_instance, webview_window
+    global tracker_instance
     
     try:
         tracker_instance = TeamFXTracker()
         threading.Thread(target=start_flask, daemon=True).start()
         tracker_instance.start_monitoring()
         
-        webview_window = webview.create_window(
+        webview.create_window(
             Config.WINDOW_TITLE,
             f'http://127.0.0.1:{Config.PORT}',
             width=Config.WINDOW_WIDTH,
